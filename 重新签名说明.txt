@@ -1,0 +1,29 @@
+人生记录：重新签名并覆盖安装
+
+平时怎么用
+1. 解锁你的 iPhone，放在这台 Mac 旁边。能接数据线时更稳定。
+2. 双击同目录的「重新签名安装.command」。
+3. 等它显示“安装成功”和签名实际到期时间，再打开手机上的人生记录。
+
+这会使用本机 Xcode 中原来的 Apple 账号，不需要提供密码给脚本。
+脚本不会购买会员、卸载 App 或清空记录；不改 App 标识和签名团队。
+苹果可能复用还有效的签名，因此提前运行不保证额外延长7天；脚本显示实际有效期。
+
+如果 Mac 拦住 .command 文件：可以在终端运行：
+python3 /Users/lizhirui/Developer/LifeRecordApp/Scripts/resign_install.py
+不要通过关闭系统安全保护来解决。
+
+如果提示手机没连接：解锁、保持蓝牙/Wi-Fi可用，或用数据线连接并确认信任。
+如果提示账号需要登录：打开 Xcode → Settings → Accounts，用原 Apple 账号登录。
+如果构建/安装失败：项目 validation/resign/日期时间/ 下有日志，可发给 Codex 分析。
+不要卸载手机 App 来“修复”，也不要换 App 标识或签名账号，以免丢失本机记录。
+
+给 Codex / Luna 的快捷用法
+只检查，不安装：python3 Scripts/resign_install.py --check
+重新签名并安装手机：python3 Scripts/resign_install.py
+将来手表建立开发连接后，同时安装手机手表：python3 Scripts/resign_install.py --watch
+当前手表开发连接尚未建立，默认只更新手机。
+运行失败时先读当次日志，不要自动改项目、重置手机或解除配对。
+
+脚本要留在完整项目里，不能只把 .command 文件单独拿走。
+脚本相对自身定位项目，项目文件夹整体移动后仍可运行。

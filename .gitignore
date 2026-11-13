@@ -1,0 +1,31 @@
+# Local products, caches and runtime evidence
+/dist/
+/validation/
+/build/
+/DerivedData/
+**/DerivedData/
+**/.build/
+**/.swiftpm/
+**/__pycache__/
+*.py[cod]
+.DS_Store
+*.log
+*.xcresult/
+*.xcactivitylog
+*.xcuserstate
+**/xcuserdata/
+.resign-install.lock/
+
+# Device-specific signing configuration and credentials
+/Scripts/resign-config.json
+.env
+.env.*
+!.env.example
+*.p12
+*.p8
+*.mobileprovision
+*.provisionprofile
+*.key
+
+# Keep upstream Git histories locally; commit their source as ordinary files.
+/Upstream/*/.git/

@@ -1,0 +1,180 @@
+//
+//  SceneDelegate.m
+//  Overland
+//
+//  Created by Aaron Parecki on 12/10/23.
+//  Copyright © 2023 Aaron Parecki. All rights reserved.
+//
+
+#import <Foundation/Foundation.h>
+
+#import "SceneDelegate.h"
+#import "GLManager.h"
+#import "GLTripActions.h"
+#import "Overland-Swift.h"
+
+@implementation SceneDelegate
+
+- (void)sceneDidDisconnect:(UIScene *)scene {
+    // Called as the scene is being released by the system.
+    // This occurs shortly after the scene enters the background, or when its session is discarded.
+    // Release any resources associated with this scene that can be re-created the next time the scene connects.
+    // The scene may re-connect later, as its session was not necessarily discarded (see `application:didDiscardSceneSessions` instead).
+}
+
+
+- (void)sceneDidBecomeActive:(UIScene *)scene {
+    // Called when the scene has moved from an inactive state to an active state.
+    // Use this method to restart any tasks that were paused (or not yet started) when the scene was inactive.
+}
+
+
+- (void)sceneWillEnterForeground:(UIScene *)scene {
+    // Called as the scene transitions from the background to the foreground.
+    // Use this method to undo the changes made on entering the background.
+    
+    if([[NSUserDefaults standardUserDefaults] boolForKey:GLPurgeQueueOnNextLaunchDefaultsName]) {
+        [[GLManager sharedManager] deleteAllData];
+        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:GLPurgeQueueOnNextLaunchDefaultsName];
+    }
+
+}
+
+
+- (void)sceneDidEnterBackground:(UIScene *)scene {
+    // Called as the scene transitions from the foreground to the background.
+    // Use this method to save data, release shared resources, and store enough scene-specific state information
+    // to restore the scene back to its current state.
+    
+    NSLog(@"Application is entering the background");
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [[GLManager sharedManager] applicationDidEnterBackground];
+}
+
+
+- (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)URLContexts {
+    UIOpenURLContext *context = [URLContexts anyObject];
+    NSURL *url = context.URL;
+    
+    if([[url scheme] isEqualToString:@"liferecord"] && [[url host] isEqualToString:@"timers"]) {
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"LifeRecord.showTimer" object:nil];
+    } else if([[url host] isEqualToString:@"end-trip"]) {
+        // From the Live Activity's End Trip button
+        [TripEndConfirmation presentIn:self.window];
+    } else if([[url host] isEqualToString:@"setup"]) {
+        NSURLComponents *urlComponents = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+        NSArray *queryItems  = urlComponents.queryItems;
+        NSString *endpoint = [self queryValueForKey:@"url" fromQueryItems:queryItems];
+        NSString *token    = [self queryValueForKey:@"token" fromQueryItems:queryItems];
+        NSString *deviceId = [self queryValueForKey:@"device_id" fromQueryItems:queryItems];
+        NSString *uniqueId = [self queryValueForKey:@"unique_id" fromQueryItems:queryItems];
+        NSLog(@"Saving new config endpoint=%@ token=%@ device_id=%@ unique_id=%@", endpoint, token, deviceId, uniqueId);
+        [[GLManager sharedManager] saveNewDeviceId:deviceId];
+        [[GLManager sharedManager] saveNewAPIEndpoint:endpoint andAccessToken:token];
+        // A setup link configures a server, so send there instead of iCloud Drive
+        if(endpoint.length > 0) {
+            [GLManager sharedManager].savesToICloudDrive = NO;
+        }
+        [[NSUserDefaults standardUserDefaults] setBool:[uniqueId isEqualToString:@"yes"] forKey:GLIncludeUniqueIdDefaultsName];
+        NSMutableArray *customHeaders = [NSMutableArray array];
+        for (NSURLQueryItem *item in queryItems) {
+            if ([item.name hasPrefix:@"header_"]) {
+                NSString *headerKey = [item.name substringFromIndex:7];
+                if (headerKey.length > 0 && item.value.length > 0) {
+                    [customHeaders addObject:@{@"key": headerKey, @"value": item.value}];
+                }
+            }
+        }
+        // A setup link always replaces the full list of custom headers, even if it has none
+        [[GLManager sharedManager] saveCustomHeaders:customHeaders];
+    }
+}
+
+- (NSString *)queryValueForKey:(NSString *)key fromQueryItems:(NSArray *)queryItems
+{
+    NSPredicate *predicate = [NSPredicate predicateWithFormat:@"name=%@", key];
+    NSURLQueryItem *queryItem = [[queryItems filteredArrayUsingPredicate:predicate] firstObject];
+    return queryItem.value;
+}
+
+#pragma mark - Quick Actions
+
+// https://developer.apple.com/documentation/uikit/menus_and_shortcuts/add_home_screen_quick_actions?language=objc
+
+- (void)sceneWillResignActive:(UIScene *)scene {
+    // Called when the scene will move from an active state to an inactive state.
+    // This may occur due to temporary interruptions (ex. an incoming phone call).
+    
+    [[GLManager sharedManager] applicationWillResignActive];
+
+    [GLTripActions updateQuickActions];
+}
+
+
+- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
+    // Storyboard keeps the existing Tracker and Settings tabs. Life is the new first tab.
+    UITabBarController *tabs = [self.window.rootViewController isKindOfClass:UITabBarController.class]
+        ? (UITabBarController *)self.window.rootViewController : nil;
+    if(tabs) {
+        [LifeIntegration setCaptureViewController:tabs];
+        self.window.rootViewController = [LifeIntegration makeViewController];
+    }
+    // Resume only the local queue outlet; this does not turn on tracking or ask for access.
+    [[GLManager sharedManager] sendQueueNow];
+
+    // If the app isn’t already loaded, it’s launched and passes details of the shortcut item in through the connectionOptions parameter of the scene:willConnectToSession:options: function.
+
+    if(connectionOptions.shortcutItem != nil) {
+        NSLog(@"App launched. connectionOptions = %@", connectionOptions);
+        [self handleLaunchFromShortcutItem:connectionOptions.shortcutItem];
+    }
+
+    // A link that launches the app, such as the Live Activity's End Trip button. Wait until the
+    // window is set up before showing anything.
+    if(connectionOptions.URLContexts.count > 0) {
+        NSSet<UIOpenURLContext *> *contexts = connectionOptions.URLContexts;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self scene:scene openURLContexts:contexts];
+        });
+    }
+
+    // A Siri shortcut that launches the app arrives here, rather than in scene:continueUserActivity:
+    for(NSUserActivity *userActivity in connectionOptions.userActivities) {
+        [self handleUserActivity:userActivity];
+    }
+}
+
+- (void)scene:(UIScene *)scene continueUserActivity:(NSUserActivity *)userActivity {
+    [self handleUserActivity:userActivity];
+}
+
+- (void)handleUserActivity:(NSUserActivity *)userActivity {
+    NSString *startTrackingActivityType = [NSString stringWithFormat:@"%@.startTracking", [[NSBundle mainBundle] bundleIdentifier]];
+
+    if([userActivity.activityType isEqualToString:startTrackingActivityType]) {
+        NSLog(@"startTracking - called from shortcut");
+        [[GLManager sharedManager] startAllUpdates];
+    }
+}
+
+- (void)windowScene:(UIWindowScene *)windowScene performActionForShortcutItem:(UIApplicationShortcutItem *)shortcutItem completionHandler:(void (^)(BOOL))completionHandler {
+    // If your app is already loaded, the system calls the windowScene:performActionForShortcutItem:completionHandler: function of your scene delegate.
+    NSLog(@"Quick Action requested when app already loaded");
+    NSLog(@"shortcutItem = %@", shortcutItem);
+    
+    [self handleLaunchFromShortcutItem:shortcutItem];
+}
+
+- (void)handleLaunchFromShortcutItem:(UIApplicationShortcutItem *)shortcutItem {
+    if([shortcutItem.type isEqualToString:@"stop"]) {
+        [GLTripActions endTripRestoringTracking];
+        [IntentDonations tripEnded];
+    } else {
+        [GLTripActions startTripWithMode:shortcutItem.type];
+        [IntentDonations tripStartedWithMode:[GLManager sharedManager].currentTripMode];
+    }
+}
+
+
+@end
+

@@ -1,0 +1,2905 @@
+//
+//  GLManager.m
+//  GPSLogger
+//
+//  Created by Aaron Parecki on 9/17/15.
+//  Copyright © 2015 Esri. All rights reserved.
+//  Copyright © 2017 Aaron Parecki. All rights reserved.
+//
+
+#import "GLManager.h"
+#import <UIKit/UIKit.h>
+#import "LOLDatabase.h"
+#import "fmdb/FMDatabase.h"
+@import NetworkExtension;
+#import "Overland-Swift.h"
+#import "GLCloudFileWriter.h"
+@import UserNotifications;
+
+@interface GLManager()
+
+@property (strong, nonatomic) CLLocationManager *locationManager;
+@property (strong, nonatomic) CMMotionActivityManager *motionActivityManager;
+@property (strong, nonatomic) CMPedometer *pedometer;
+
+@property BOOL trackingEnabled;
+@property BOOL sendInProgress;
+@property BOOL batchInProgress;
+@property (strong, nonatomic) CLLocation *lastLocation;
+@property (strong, nonatomic) CLLocation *lastDeviceLocation;
+@property (strong, nonatomic) NSString *lastSendErrorTitle;
+@property (strong, nonatomic) NSString *lastSendErrorMessage;
+@property (strong, nonatomic) CMMotionActivity *lastMotion;
+@property (strong, nonatomic) NSDate *lastSentDate;
+@property (strong, nonatomic) NSString *lastLocationName;
+
+@property (strong, nonatomic) NSDictionary *lastLocationDictionary;
+@property (strong, nonatomic) NSDictionary *tripStartLocationDictionary;
+
+@property (strong, nonatomic) LOLDatabase *db;
+@property (strong, nonatomic) FMDatabase *tripdb;
+
+@property (strong, nonatomic) NSDate *lastScheduledNotificationDate;
+
+@end
+
+@implementation GLManager
+
+static NSString *const GLLocationQueueName = @"GLLocationQueue";
+
+NSNumber *_sendingInterval;
+bool _currentTripHasNewData;
+bool _storeNextLocationAsTripStart = NO;
+bool _tripEndInProgress = NO;
+// Set while "Discard points while stationary" is dropping points, until the phone moves again
+bool _inStationaryStop = NO;
+NSDate *_lastStationaryPointDate;
+// While stationary, keep a point at least this often, so a gap in the data means data is missing
+static const NSTimeInterval GLStationaryHeartbeatInterval = 60 * 60;
+NSString *_currentWifiHotSpotName = @"";
+NSString *_currentWifiBSSID = @"";
+long _currentPointsInQueue;
+NSString *_deviceId;
+CLLocationDistance _currentTripDistanceCached;
+NSURLSession *_httpSession;
+NSDictionary *_httpHeaders;
+
+const double FEET_TO_METERS = 0.304;
+const double MPH_to_METERSPERSECOND = 0.447;
+
++ (GLManager *)sharedManager {
+    static GLManager *_instance = nil;
+    
+    @synchronized (self) {
+        if (_instance == nil) {
+            _instance = [[self alloc] init];
+            
+            _instance.db = [[LOLDatabase alloc] initWithPath:[self cacheDatabasePath]];
+            _instance.db.serializer = ^(id object){
+                return [self dataWithJSONObject:object error:NULL];
+            };
+            _instance.db.deserializer = ^(NSData *data) {
+                return [self objectFromJSONData:data error:NULL];
+            };
+            
+            _instance.tripdb = [FMDatabase databaseWithPath:[self tripDatabasePath]];
+            [_instance setUpTripDB];
+            
+            [_instance setupHTTPClient];
+            [_instance restoreTrackingState];
+            [_instance initializeNotifications];
+            
+            _instance.pedometer = [[CMPedometer alloc] init];
+        }
+    }
+    
+    return _instance;
+}
+
+#pragma mark - GLManager control (public)
+
+- (void)saveNewAPIEndpoint:(NSString *)endpoint andAccessToken:(NSString *)accessToken {
+    [[NSUserDefaults standardUserDefaults] setObject:endpoint forKey:GLAPIEndpointDefaultsName];
+    [[NSUserDefaults standardUserDefaults] setObject:accessToken forKey:GLAPIAccessTokenDefaultsName];
+    [self setupHTTPClient];
+}
+
+- (NSString *)apiEndpointURL {
+    return [[NSUserDefaults standardUserDefaults] stringForKey:GLAPIEndpointDefaultsName];
+}
+
+- (NSString *)apiAccessToken {
+    return [[NSUserDefaults standardUserDefaults] stringForKey:GLAPIAccessTokenDefaultsName];
+}
+
+- (void)saveNewDeviceId:(NSString *)deviceId {
+    _deviceId = deviceId;
+    [[NSUserDefaults standardUserDefaults] setObject:deviceId forKey:GLDeviceIdDefaultsName];
+    // Always call saveNewAPIEndpoint after saveNewDeviceId to synchronize changes
+}
+
+- (NSString *)deviceId {
+    NSString *d = [[NSUserDefaults standardUserDefaults] stringForKey:GLDeviceIdDefaultsName];
+    if(d == nil) {
+        d = @"";
+    }
+    return d;
+}
+
+- (NSArray *)customHeaders {
+    NSArray *headers = [[NSUserDefaults standardUserDefaults] arrayForKey:GLCustomHeadersDefaultsName];
+    if (headers == nil) {
+        return @[];
+    }
+    return headers;
+}
+
+- (void)saveCustomHeaders:(NSArray *)headers {
+    [[NSUserDefaults standardUserDefaults] setObject:headers forKey:GLCustomHeadersDefaultsName];
+    [self setupHTTPClient];
+    [[NSNotificationCenter defaultCenter] postNotificationName:GLSettingsChangedNotification object:self];
+}
+
++ (BOOL)isBlockedCustomHeaderName:(NSString *)name {
+    for(NSString *blocked in @[@"Authorization", @"Content-Type", @"Host"]) {
+        if([name caseInsensitiveCompare:blocked] == NSOrderedSame) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+- (void)startAllUpdates {
+    [self enableTracking];
+    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:GLTrackingStateDefaultsName];
+}
+
+- (void)stopAllUpdates {
+    [self disableTracking];
+    [[NSUserDefaults standardUserDefaults] setBool:NO forKey:GLTrackingStateDefaultsName];
+}
+
+- (void)refreshLocation {
+    NSLog(@"Trying to update location now");
+    [self.locationManager stopUpdatingLocation];
+    [self.locationManager performSelector:@selector(startUpdatingLocation) withObject:nil afterDelay:1.0];
+}
+
+// LifeRecord: transfer raw evidence to the local record store. Cloud upload belongs to LifeStore.
+// A successful local commit is the only event that removes records from the capture queue.
+- (void)sendQueueNow {
+    if(self.sendInProgress) return;
+    NSMutableSet *keys = [NSMutableSet set];
+    NSMutableArray *features = [NSMutableArray array];
+    [self.db accessCollection:GLLocationQueueName withBlock:^(id<LOLDatabaseAccessor> accessor) {
+        [accessor enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSDictionary *object) {
+            if(key && object) {
+                [keys addObject:key];
+                [features addObject:object];
+            }
+            return (BOOL)(features.count >= 500);
+        }];
+    }];
+    if(features.count == 0) return;
+    NSError *encodingError = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"locations": features} options:0 error:&encodingError];
+    if(!data) {
+        [self batchFailed:encodingError.localizedDescription title:@"本机记录保存失败"];
+        return;
+    }
+    [self sendingStarted];
+    [LifeIntegration importLocationFeatures:data completion:^(NSError *error) {
+        if(error) {
+            [self batchFailed:error.localizedDescription title:@"本机记录保存失败（原始队列已保留）"];
+            return;
+        }
+        [self.db accessCollection:GLLocationQueueName withBlock:^(id<LOLDatabaseAccessor> accessor) {
+            for(NSString *key in keys) [accessor removeDictionaryForKey:key];
+        }];
+        self.lastSendErrorTitle = nil;
+        self.lastSendErrorMessage = nil;
+        self.lastSentDate = NSDate.date;
+        [self sendingFinishedWithSentKeys:keys];
+        if(features.count == 500) {
+            dispatch_async(dispatch_get_main_queue(), ^{ [self sendQueueNow]; });
+        }
+    }];
+}
+
+// Preserved upstream implementation for reference; the LifeRecord fork never calls this network/file outlet.
+- (void)legacySendQueueNow {
+    NSMutableSet *syncedUpdates = [NSMutableSet set];
+    NSMutableArray *locationUpdates = [NSMutableArray array];
+    
+    NSString *endpoint = [[NSUserDefaults standardUserDefaults] stringForKey:GLAPIEndpointDefaultsName];
+    BOOL saveToICloud = self.savesToICloudDrive;
+
+    if(!saveToICloud && endpoint == nil) {
+        NSLog(@"No API endpoint is set, not sending data");
+        return;
+    }
+    
+    __block long _numInQueue = 0;
+    
+    [self.db accessCollection:GLLocationQueueName withBlock:^(id<LOLDatabaseAccessor> accessor) {
+        
+        [accessor enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSDictionary *object) {
+            if(key && object) {
+                [syncedUpdates addObject:key];
+                [locationUpdates addObject:object];
+            } else if(key) {
+                // Remove nil objects
+                [accessor removeDictionaryForKey:key];
+            }
+            return (BOOL)(locationUpdates.count >= self.pointsPerBatchCurrentValue);
+        }];
+        
+        [accessor countObjectsUsingBlock:^(long num) {
+            _numInQueue = num;
+        }];
+    }];
+    
+    NSMutableDictionary *postData;
+    
+    if(self.usesOwntracksFormat) {
+        // The queue may be empty, which is handled below before sending
+        postData = locationUpdates.firstObject;
+    } else {
+        // The batch size isn't known until now, so fill in locations_in_payload on the points that
+        // were recorded with tracking stats enabled
+        for(int i=0; i<locationUpdates.count; i++) {
+            NSDictionary *properties = [locationUpdates[i] objectForKey:@"properties"];
+            if([properties objectForKey:@"locations_in_payload"]) {
+                NSMutableDictionary *newProperties = [properties mutableCopy];
+                [newProperties setValue:[NSNumber numberWithLong:locationUpdates.count] forKey:@"locations_in_payload"];
+                NSMutableDictionary *update = [locationUpdates[i] mutableCopy];
+                [update setValue:newProperties forKey:@"properties"];
+                locationUpdates[i] = update;
+            }
+        }
+
+        postData = [NSMutableDictionary dictionaryWithDictionary:@{@"locations": locationUpdates}];
+        
+        // If there are still more in the queue, then send the current location as a separate property.
+        // This allows the server to know where the user is immediately even if there are many thousands of points in the backlog.
+        NSDictionary *currentLocation = [self currentDictionaryFromLocation:self.lastLocation];
+        if(_numInQueue > self.pointsPerBatchCurrentValue && self.lastLocation) {
+            [postData setObject:currentLocation forKey:@"current"];
+        }
+        
+        if(self.tripInProgress) {
+            NSDictionary *currentTripInfo = [self currentTripDictionary];
+            [postData setObject:currentTripInfo forKey:@"trip"];
+        }
+    }
+
+    if(saveToICloud) {
+        if(locationUpdates.count == 0) {
+            self.batchInProgress = NO;
+            return;
+        }
+        [self sendingStarted];
+        [[GLCloudFileWriter sharedWriter] writeFeatures:locationUpdates mode:self.cloudFileMode completion:^(NSString *errorMessage) {
+            if(errorMessage) {
+                [self batchFailed:errorMessage title:@"Couldn't Save to iCloud Drive"];
+            } else {
+                [self batchWasSent:syncedUpdates response:nil];
+            }
+        }];
+        return;
+    }
+    
+    // If there are any template strings in the URL, replace the values with the data from the most recent location
+    // TS, LAT, LON, ACC, SPD, ALT, BAT
+    NSMutableString *endpointURL = [endpoint mutableCopy];
+    [endpointURL replaceOccurrencesOfString:@"%TS"
+                                 withString:[self stringForProperty:kGLLocationPropertyTimestamp ofLocation:self.lastLocation] options:NSLiteralSearch
+                                      range:NSMakeRange(0, endpointURL.length)];
+    [endpointURL replaceOccurrencesOfString:@"%LAT"
+                                 withString:[self stringForProperty:kGLLocationPropertyLatitude ofLocation:self.lastLocation] options:NSLiteralSearch
+                                      range:NSMakeRange(0, endpointURL.length)];
+    [endpointURL replaceOccurrencesOfString:@"%LON"
+                                 withString:[self stringForProperty:kGLLocationPropertyLongitude ofLocation:self.lastLocation] options:NSLiteralSearch
+                                      range:NSMakeRange(0, endpointURL.length)];
+    [endpointURL replaceOccurrencesOfString:@"%ACC"
+                                 withString:[self stringForProperty:kGLLocationPropertyAccuracy ofLocation:self.lastLocation] options:NSLiteralSearch
+                                      range:NSMakeRange(0, endpointURL.length)];
+    [endpointURL replaceOccurrencesOfString:@"%SPD"
+                                 withString:[self stringForProperty:kGLLocationPropertySpeed ofLocation:self.lastLocation] options:NSLiteralSearch
+                                      range:NSMakeRange(0, endpointURL.length)];
+    [endpointURL replaceOccurrencesOfString:@"%ALT"
+                                 withString:[self stringForProperty:kGLLocationPropertyAltitude ofLocation:self.lastLocation] options:NSLiteralSearch
+                                      range:NSMakeRange(0, endpointURL.length)];
+    [endpointURL replaceOccurrencesOfString:@"%BAT"
+                                 withString:[self stringForProperty:kGLLocationPropertyBattery ofLocation:self.lastLocation] options:NSLiteralSearch
+                                      range:NSMakeRange(0, endpointURL.length)];
+
+    
+    NSLog(@"Endpoint: %@", endpointURL);
+    NSLog(@"Updates in post: %lu", (unsigned long)locationUpdates.count);
+    
+    if(locationUpdates.count == 0) {
+        self.batchInProgress = NO;
+        return;
+    }
+    
+    [self sendingStarted];
+    
+    [self postJSON:postData toURL:endpointURL success:^(id _Nullable responseObject) {
+        NSLog(@"Response: %@", responseObject);
+
+        // With "Consider HTTP 2XX Successful" on, the response can be anything (e.g. the OwnTracks
+        // Recorder returns an array), so only read properties from it if it's a JSON object
+        NSDictionary *responseDictionary = [responseObject isKindOfClass:[NSDictionary class]] ? responseObject : nil;
+
+        bool requestWasSuccessfullySent = NO;
+        if(self.shouldConsiderHTTP200Success) {
+            // Any non-200 response would have been caught by the error callback instead
+            requestWasSuccessfullySent = YES;
+        } else {
+            // Response must be JSON
+            if(![responseObject respondsToSelector:@selector(objectForKey:)]) {
+                [self batchFailed:@"Server did not return a JSON object" title:@"Server Error"];
+                return;
+            }
+
+            // Response JSON must include {"result":"ok"}
+            requestWasSuccessfullySent = [responseObject objectForKey:@"result"] && [[responseObject objectForKey:@"result"] isEqualToString:@"ok"];
+        }
+        
+        
+        if(requestWasSuccessfullySent) {
+            [self batchWasSent:syncedUpdates response:responseDictionary];
+        } else if([responseObject objectForKey:@"error"]) {
+            [self batchFailed:[responseObject objectForKey:@"error"] title:@"Server Error"];
+        } else {
+            [self batchFailed:@"Server did not acknowledge the data was received, and did not return an error message" title:@"Server Error"];
+        }
+    } failure:^(NSString *errorMessage) {
+        [self batchFailed:errorMessage title:@"HTTP Error"];
+    }];
+    
+}
+
+// Removes a batch that was sent or saved from the queue. The response is the server's, or nil.
+- (void)batchWasSent:(NSSet *)syncedUpdates response:(NSDictionary *)responseDictionary {
+    self.lastSendErrorTitle = nil;
+    self.lastSendErrorMessage = nil;
+    self.lastSentDate = NSDate.date;
+    NSDictionary *geocode = [responseDictionary objectForKey:@"geocode"];
+    if([geocode isKindOfClass:[NSDictionary class]]) {
+        self.lastLocationName = [geocode objectForKey:@"full_name"];
+    } else {
+        self.lastLocationName = @"";
+    }
+    
+    [self.db accessCollection:GLLocationQueueName withBlock:^(id<LOLDatabaseAccessor> accessor) {
+        for(NSString *key in syncedUpdates) {
+            [accessor removeDictionaryForKey:key];
+        }
+    }];
+
+    [self.db accessCollection:GLLocationQueueName withBlock:^(id<LOLDatabaseAccessor> accessor) {
+        [accessor countObjectsUsingBlock:^(long num) {
+            _currentPointsInQueue = num;
+            NSLog(@"Number remaining: %ld", num);
+            if(num >= self.pointsPerBatchCurrentValue) {
+                self.batchInProgress = YES;
+            } else {
+                self.batchInProgress = NO;
+            }
+        }];
+
+        [self sendingFinishedWithSentKeys:syncedUpdates];
+    }];
+
+    [self updateSettingsFromResponse:responseDictionary];
+}
+
+// Keeps the batch in the queue to try again later
+- (void)batchFailed:(NSString *)message title:(NSString *)title {
+    // Shown on the tracker screen too, since notifications may be turned off
+    self.lastSendErrorTitle = title;
+    self.lastSendErrorMessage = message;
+    self.batchInProgress = NO;
+    [self notify:message withTitle:title];
+    [self sendingFinished];
+}
+
+#pragma mark - Destination
+
+- (BOOL)savesToICloudDrive {
+    return [[[NSUserDefaults standardUserDefaults] stringForKey:GLDestinationDefaultsName] isEqualToString:@"icloud"];
+}
+- (void)setSavesToICloudDrive:(BOOL)iCloud {
+    [[NSUserDefaults standardUserDefaults] setObject:(iCloud ? @"icloud" : @"server") forKey:GLDestinationDefaultsName];
+}
+
+- (GLCloudFileMode)cloudFileMode {
+    if([[[NSUserDefaults standardUserDefaults] stringForKey:GLCloudFileModeDefaultsName] isEqualToString:@"trips"]) {
+        return GLCloudFileModeTrips;
+    }
+    return GLCloudFileModeDaily;
+}
+- (void)setCloudFileMode:(GLCloudFileMode)mode {
+    [[NSUserDefaults standardUserDefaults] setObject:(mode == GLCloudFileModeTrips ? @"trips" : @"daily") forKey:GLCloudFileModeDefaultsName];
+}
+
+- (BOOL)hasDestination {
+    return YES; // LifeRecord always has a local destination; iCloud is an independent later sync.
+}
+
+// The OwnTracks format is only for sending to a server. Files in iCloud Drive are always GeoJSON.
+- (BOOL)usesOwntracksFormat {
+    return NO; // The local adapter consumes the full GeoJSON evidence format.
+}
+
+- (void)updateSettingsFromResponse:(id _Nullable)responseObject {
+    NSDictionary *settings = [responseObject objectForKey:@"set"];
+    if(settings == nil) {
+        return;
+    }
+    
+    if(![settings respondsToSelector:@selector(objectForKey:)]) {
+        return;
+    }
+    
+    NSLog(@"Settings %@", settings);
+    
+    NSDictionary *sendIntervalBlocks = @{
+        @"1s": ^{ self.sendingInterval = @1; },
+        @"5s": ^{ self.sendingInterval = @5; },
+        @"10s": ^{ self.sendingInterval = @10; },
+        @"15s": ^{ self.sendingInterval = @15; },
+        @"30s": ^{ self.sendingInterval = @30; },
+        @"1m": ^{ self.sendingInterval = @60; },
+        @"2m": ^{ self.sendingInterval = @120; },
+        @"5m": ^{ self.sendingInterval = @300; },
+        @"10m": ^{ self.sendingInterval = @600; },
+        @"30m": ^{ self.sendingInterval = @1800; },
+        @"off": ^{ self.sendingInterval = @0; },
+    };
+    [self runBlock:sendIntervalBlocks fromDictionary:settings forKey:@"send_interval"];
+
+    if([settings objectForKey:@"send_wifi_only"] != nil) {
+        [GLWifiOnlySending shared].enabled = [[settings objectForKey:@"send_wifi_only"] boolValue];
+    }
+
+    NSString *tripMode = [settings objectForKey:@"trip_mode"];
+    if([tripMode respondsToSelector:@selector(isEqualToString:)]) {
+        NSString *modeID = [GLTripModeStore modeIDForServerValue:tripMode];
+        if(modeID) {
+            self.currentTripMode = modeID;
+        }
+    }
+    
+    NSDictionary *main = [settings objectForKey:@"main"];
+    if(main != nil) {
+        
+        NSDictionary *trackingModeBlocks = @{
+            @"off": ^{ self.trackingMode = kGLTrackingModeOff; },
+            @"standard": ^{ self.trackingMode = kGLTrackingModeStandard; },
+            @"significant": ^{ self.trackingMode = kGLTrackingModeSignificant; },
+            @"both": ^{ self.trackingMode = kGLTrackingModeStandardAndSignificant; },
+        };
+        [self runBlock:trackingModeBlocks fromDictionary:main forKey:@"tracking_mode"];
+
+        if([main objectForKey:@"visit_tracking"] != nil) {
+            self.visitTrackingEnabled = [[main objectForKey:@"visit_tracking"] boolValue];
+        }
+        
+        NSDictionary *desiredAccuracyBlocks = @{
+            @"nav": ^{ self.desiredAccuracy = kCLLocationAccuracyBestForNavigation; },
+            @"best": ^{ self.desiredAccuracy = kCLLocationAccuracyBest; },
+            @"10m": ^{ self.desiredAccuracy = kCLLocationAccuracyNearestTenMeters; },
+            @"100m": ^{ self.desiredAccuracy = kCLLocationAccuracyHundredMeters; },
+            @"1km": ^{ self.desiredAccuracy = kCLLocationAccuracyKilometer; },
+            @"3km": ^{ self.desiredAccuracy = kCLLocationAccuracyThreeKilometers; },
+        };
+        [self runBlock:desiredAccuracyBlocks fromDictionary:main forKey:@"desired_accuracy"];
+
+        NSDictionary *activityTypeBlocks = @{
+            @"other": ^{ self.activityType = CLActivityTypeOther; },
+            @"car": ^{ self.activityType = CLActivityTypeAutomotiveNavigation; },
+            @"fitness": ^{ self.activityType = CLActivityTypeFitness; },
+            @"nav": ^{ self.activityType = CLActivityTypeOtherNavigation; },
+            @"air": ^{ self.activityType = CLActivityTypeAirborne; },
+            @"boat": ^{
+                if (@available(iOS 27.0, *)) {
+                    self.activityType = CLActivityTypeMaritime;
+                }
+            },
+        };
+        [self runBlock:activityTypeBlocks fromDictionary:main forKey:@"activity_type"];
+
+        if([main objectForKey:@"background_indicator"] != nil) {
+            self.showBackgroundLocationIndicator = [[main objectForKey:@"background_indicator"] boolValue];
+        }
+
+        if([main objectForKey:@"pause_automatically"] != nil) {
+            self.pausesAutomatically = [[main objectForKey:@"pause_automatically"] boolValue];
+        }
+
+        NSDictionary *loggingModeBlocks = @{
+            @"all": ^{ self.loggingMode = kGLLoggingModeAllData; },
+            @"latest": ^{ self.loggingMode = kGLLoggingModeOnlyLatest; },
+            @"owntracks": ^{ self.loggingMode = kGLLoggingModeOwntracks; },
+        };
+        [self runBlock:loggingModeBlocks fromDictionary:main forKey:@"logging_mode"];
+        
+        NSDictionary *batchSizeBlocks = @{
+            @50: ^{ self.pointsPerBatch = 50; },
+            @100: ^{ self.pointsPerBatch = 100; },
+            @200: ^{ self.pointsPerBatch = 200; },
+            @500: ^{ self.pointsPerBatch = 500; },
+            @1000: ^{ self.pointsPerBatch = 1000; },
+        };
+        [self runBlock:batchSizeBlocks fromDictionary:main forKey:@"batch_size"];
+
+        NSDictionary *resumeWithGeofenceBlocks = @{
+            @"off": ^{ self.resumesAfterDistance = -1; },
+            @"100m": ^{ self.resumesAfterDistance = 100; },
+            @"200m": ^{ self.resumesAfterDistance = 200; },
+            @"500m": ^{ self.resumesAfterDistance = 500; },
+            @"1km": ^{ self.resumesAfterDistance = 1000; },
+            @"2km": ^{ self.resumesAfterDistance = 2000; },
+        };
+        [self runBlock:resumeWithGeofenceBlocks fromDictionary:main forKey:@"resume_with_geofence"];
+
+        NSDictionary *minDistanceBlocks = @{
+            @"off": ^{ self.discardPointsWithinDistance = -1; },
+            @"1m": ^{ self.discardPointsWithinDistance = 1; },
+            @"10m": ^{ self.discardPointsWithinDistance = 10; },
+            @"50m": ^{ self.discardPointsWithinDistance = 50; },
+            @"100m": ^{ self.discardPointsWithinDistance = 100; },
+            @"500m": ^{ self.discardPointsWithinDistance = 500; },
+        };
+        [self runBlock:minDistanceBlocks fromDictionary:main forKey:@"min_distance"];
+
+        NSDictionary *minTimeBlocks = @{
+            @"1s": ^{ self.discardPointsWithinSeconds = 1; },
+            @"5s": ^{ self.discardPointsWithinSeconds = 5; },
+            @"10s": ^{ self.discardPointsWithinSeconds = 10; },
+            @"30s": ^{ self.discardPointsWithinSeconds = 30; },
+            @"1m": ^{ self.discardPointsWithinSeconds = 60; },
+            @"5m": ^{ self.discardPointsWithinSeconds = 300; },
+        };
+        [self runBlock:minTimeBlocks fromDictionary:main forKey:@"min_time"];
+
+        // A number of meters, or "off"
+        id maxAccuracy = [main objectForKey:@"max_accuracy"];
+        if([maxAccuracy respondsToSelector:@selector(doubleValue)]) {
+            self.discardPointsWorseThanAccuracy = [maxAccuracy doubleValue] > 0 ? [maxAccuracy doubleValue] : -1;
+        }
+
+        // Meters, or "off"
+        id autoStopRadius = [main objectForKey:@"auto_stop_radius"];
+        if([autoStopRadius respondsToSelector:@selector(doubleValue)]) {
+            [GLAutoStop shared].radius = [autoStopRadius doubleValue] > 0 ? [autoStopRadius doubleValue] : -1;
+        }
+
+        // Seconds
+        id autoStopTime = [main objectForKey:@"auto_stop_time"];
+        if([autoStopTime respondsToSelector:@selector(intValue)] && [autoStopTime intValue] > 0) {
+            [GLAutoStop shared].seconds = [autoStopTime intValue];
+        }
+
+        if([main objectForKey:@"discard_without_gps"] != nil) {
+            self.discardPointsWithoutGPS = [[main objectForKey:@"discard_without_gps"] boolValue];
+        }
+
+        if([main objectForKey:@"discard_stationary"] != nil) {
+            self.discardPointsWhileStationary = [[main objectForKey:@"discard_stationary"] boolValue];
+        }
+
+    }
+
+    NSDictionary *trip = [settings objectForKey:@"trip"];
+    if(trip != nil && [trip respondsToSelector:@selector(objectForKey:)]) {
+        
+        NSDictionary *desiredAccuracyDuringTripBlocks = @{
+            @"nav": ^{ self.desiredAccuracyDuringTrip = kCLLocationAccuracyBestForNavigation; },
+            @"best": ^{ self.desiredAccuracyDuringTrip = kCLLocationAccuracyBest; },
+            @"10m": ^{ self.desiredAccuracyDuringTrip = kCLLocationAccuracyNearestTenMeters; },
+            @"100m": ^{ self.desiredAccuracyDuringTrip = kCLLocationAccuracyHundredMeters; },
+            @"1km": ^{ self.desiredAccuracyDuringTrip = kCLLocationAccuracyKilometer; },
+            @"3km": ^{ self.desiredAccuracyDuringTrip = kCLLocationAccuracyThreeKilometers; },
+        };
+        [self runBlock:desiredAccuracyDuringTripBlocks fromDictionary:trip forKey:@"desired_accuracy"];
+
+        NSDictionary *activityTypeDuringTripBlocks = @{
+            @"other": ^{ self.activityTypeDuringTrip = CLActivityTypeOther; },
+            @"car": ^{ self.activityTypeDuringTrip = CLActivityTypeAutomotiveNavigation; },
+            @"fitness": ^{ self.activityTypeDuringTrip = CLActivityTypeFitness; },
+            @"nav": ^{ self.activityTypeDuringTrip = CLActivityTypeOtherNavigation; },
+            @"air": ^{ self.activityTypeDuringTrip = CLActivityTypeAirborne; },
+            @"boat": ^{
+                if (@available(iOS 27.0, *)) {
+                    self.activityTypeDuringTrip = CLActivityTypeMaritime;
+                }
+            },
+        };
+        [self runBlock:activityTypeDuringTripBlocks fromDictionary:trip forKey:@"activity_type"];
+
+        if([trip objectForKey:@"background_indicator"] != nil) {
+            self.showBackgroundLocationIndicatorDuringTrip = [[trip objectForKey:@"background_indicator"] boolValue];
+        }
+
+        if([trip objectForKey:@"prevent_screen_lock"] != nil) {
+            [[NSUserDefaults standardUserDefaults] setBool:[[trip objectForKey:@"prevent_screen_lock"] boolValue] forKey:GLScreenLockEnabledDefaultsName];
+        }
+
+        NSDictionary *loggingModeDuringTripBlocks = @{
+            @"all": ^{ self.loggingModeDuringTrip = kGLLoggingModeAllData; },
+            @"latest": ^{ self.loggingModeDuringTrip = kGLLoggingModeOnlyLatest; },
+            @"owntracks": ^{ self.loggingModeDuringTrip = kGLLoggingModeOwntracks; },
+        };
+        [self runBlock:loggingModeDuringTripBlocks fromDictionary:trip forKey:@"logging_mode"];
+        
+        NSDictionary *batchSizeDuringTripBlocks = @{
+            @50: ^{ self.pointsPerBatchDuringTrip = 50; },
+            @100: ^{ self.pointsPerBatchDuringTrip = 100; },
+            @200: ^{ self.pointsPerBatchDuringTrip = 200; },
+            @500: ^{ self.pointsPerBatchDuringTrip = 500; },
+            @1000: ^{ self.pointsPerBatchDuringTrip = 1000; },
+        };
+        [self runBlock:batchSizeDuringTripBlocks fromDictionary:trip forKey:@"batch_size"];
+
+        NSDictionary *minDistanceDuringTripBlocks = @{
+            @"off": ^{ self.discardPointsWithinDistanceDuringTrip = -1; },
+            @"1m": ^{ self.discardPointsWithinDistanceDuringTrip = 1; },
+            @"10m": ^{ self.discardPointsWithinDistanceDuringTrip = 10; },
+            @"50m": ^{ self.discardPointsWithinDistanceDuringTrip = 50; },
+            @"100m": ^{ self.discardPointsWithinDistanceDuringTrip = 100; },
+            @"500m": ^{ self.discardPointsWithinDistanceDuringTrip = 500; },
+        };
+        [self runBlock:minDistanceDuringTripBlocks fromDictionary:trip forKey:@"min_distance"];
+
+        NSDictionary *minTimeDuringTripBlocks = @{
+            @"1s": ^{ self.discardPointsWithinSecondsDuringTrip = 1; },
+            @"5s": ^{ self.discardPointsWithinSecondsDuringTrip = 5; },
+            @"10s": ^{ self.discardPointsWithinSecondsDuringTrip = 10; },
+            @"30s": ^{ self.discardPointsWithinSecondsDuringTrip = 30; },
+            @"1m": ^{ self.discardPointsWithinSecondsDuringTrip = 60; },
+            @"5m": ^{ self.discardPointsWithinSecondsDuringTrip = 300; },
+        };
+        [self runBlock:minTimeDuringTripBlocks fromDictionary:trip forKey:@"min_time"];
+
+        id maxAccuracy = [trip objectForKey:@"max_accuracy"];
+        if([maxAccuracy respondsToSelector:@selector(doubleValue)]) {
+            self.discardPointsWorseThanAccuracyDuringTrip = [maxAccuracy doubleValue] > 0 ? [maxAccuracy doubleValue] : -1;
+        }
+
+        id autoStopRadius = [trip objectForKey:@"auto_stop_radius"];
+        if([autoStopRadius respondsToSelector:@selector(doubleValue)]) {
+            [GLAutoStop shared].radiusDuringTrip = [autoStopRadius doubleValue] > 0 ? [autoStopRadius doubleValue] : -1;
+        }
+
+        id autoStopTime = [trip objectForKey:@"auto_stop_time"];
+        if([autoStopTime respondsToSelector:@selector(intValue)] && [autoStopTime intValue] > 0) {
+            [GLAutoStop shared].secondsDuringTrip = [autoStopTime intValue];
+        }
+
+        if([trip objectForKey:@"ask_to_end_when_stopped"] != nil) {
+            [[NSUserDefaults standardUserDefaults] setBool:[[trip objectForKey:@"ask_to_end_when_stopped"] boolValue] forKey:GLTripAskToEndWhenStoppedDefaultsName];
+        }
+
+        if([trip objectForKey:@"discard_without_gps"] != nil) {
+            self.discardPointsWithoutGPSDuringTrip = [[trip objectForKey:@"discard_without_gps"] boolValue];
+        }
+
+        if([trip objectForKey:@"discard_stationary"] != nil) {
+            self.discardPointsWhileStationaryDuringTrip = [[trip objectForKey:@"discard_stationary"] boolValue];
+        }
+
+    }
+
+    NSDictionary *customHeadersDict = [settings objectForKey:@"custom_headers"];
+    if (customHeadersDict != nil && [customHeadersDict respondsToSelector:@selector(enumerateKeysAndObjectsUsingBlock:)]) {
+        NSMutableArray *headers = [NSMutableArray array];
+        [customHeadersDict enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
+            if ([key isKindOfClass:[NSString class]] && [value isKindOfClass:[NSString class]]) {
+                [headers addObject:@{@"key": key, @"value": value}];
+            }
+        }];
+        [self saveCustomHeaders:headers];
+    }
+
+    [[NSNotificationCenter defaultCenter] postNotificationName:GLSettingsChangedNotification object:self];
+}
+
+- (void)runBlock:(NSDictionary *)blocks fromDictionary:(NSDictionary *)dictionary forKey:(NSString *)key {
+    NSString *property = [dictionary objectForKey:key];
+    if([property respondsToSelector:@selector(isEqualToString:)]) {
+        if([blocks objectForKey:property] != nil) {
+            ((CaseBlock)blocks[property])();
+        }
+    }
+}
+
+- (NSString *)stringForProperty:(GLLocationProperty)prop ofLocation:(CLLocation *)location {
+    NSString *string;
+    switch(prop) {
+        case kGLLocationPropertyTimestamp:
+            string = [GLManager iso8601DateStringFromDate:location.timestamp];
+            break;
+        case kGLLocationPropertyLatitude:
+            string = [[NSNumber numberWithDouble:((int)(location.coordinate.latitude * 10000000)) / 10000000.0] stringValue];
+            break;
+        case kGLLocationPropertyLongitude:
+            string = [[NSNumber numberWithDouble:((int)(location.coordinate.longitude * 10000000)) / 10000000.0] stringValue];
+            break;
+            
+        case kGLLocationPropertyAccuracy:
+            string = [[NSNumber numberWithInt:(int)round(location.horizontalAccuracy)] stringValue];
+            break;
+        case kGLLocationPropertySpeed:
+            string = [[NSNumber numberWithInt:(int)round(location.speed)] stringValue];
+            break;
+        case kGLLocationPropertyAltitude:
+            string = [[NSNumber numberWithInt:(int)round(location.altitude)] stringValue];
+            break;
+        case kGLLocationPropertyBattery:
+            string = [[self currentBatteryLevel] stringValue];
+            break;
+    }
+    return string;
+}
+
+- (void)logAction:(NSString *)action {
+    if(!self.includeTrackingStats) {
+        return;
+    }
+
+    [self.db accessCollection:GLLocationQueueName withBlock:^(id<LOLDatabaseAccessor> accessor) {
+        NSString *timestamp = [GLManager iso8601DateStringFromDate:[NSDate date]];
+        NSMutableDictionary *update = [NSMutableDictionary dictionaryWithDictionary:@{
+                                                                                      @"type": @"Feature",
+                                                                                      @"properties": [NSMutableDictionary dictionaryWithDictionary:@{
+                                                                                              @"timestamp": timestamp,
+                                                                                              @"action": action,
+                                                                                              }]
+                                                                                      }];
+        [self addMetadataToUpdate:update];
+        
+        if(self.lastLocation) {
+            [update setObject:@{
+                                @"type": @"Point",
+                                @"coordinates": @[
+                                        [NSNumber numberWithDouble:self.lastLocation.coordinate.longitude],
+                                        [NSNumber numberWithDouble:self.lastLocation.coordinate.latitude]
+                                        ]
+                                } forKey:@"geometry"];
+        }
+        [accessor setDictionary:update forKey:[NSString stringWithFormat:@"%@-log", timestamp]];
+    }];
+}
+
+- (void)numberOfLocationsInQueue:(void(^)(long num))callback {
+    [self.db accessCollection:GLLocationQueueName withBlock:^(id<LOLDatabaseAccessor> accessor) {
+        [accessor countObjectsUsingBlock:^(long num) {
+            _currentPointsInQueue = num;
+            callback(num);
+        }];
+    }];
+}
+
+- (void)numberOfObjectsInQueue:(void(^)(long locations, long trips, long stats))callback {
+    [self.db accessCollection:GLLocationQueueName withBlock:^(id<LOLDatabaseAccessor> accessor) {
+        __block long locations = 0;
+        __block long trips = 0;
+        __block long stats = 0;
+        [accessor enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSDictionary *object) {
+            NSDictionary *properties = [object objectForKey:@"properties"];
+            if([properties objectForKey:@"action"]) {
+                stats++;
+            } else if([[properties objectForKey:@"type"] isEqualToString:@"trip"]) {
+                trips++;
+            } else {
+                locations++;
+            }
+            return NO;
+        }];
+        //NSLog(@"Queue stats: %ld %ld %ld", locations, trips, stats);
+        callback(locations, trips, stats);
+    }];
+}
+
+- (void)queuedLocations:(void(^)(NSArray<NSString *> *keys, NSArray<CLLocation *> *locations))callback {
+    NSMutableArray *keys = [NSMutableArray array];
+    NSMutableArray *locations = [NSMutableArray array];
+    NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
+    [self.db accessCollection:GLLocationQueueName withBlock:^(id<LOLDatabaseAccessor> accessor) {
+        [accessor enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSDictionary *object) {
+            if(![object isKindOfClass:[NSDictionary class]]) {
+                return NO;
+            }
+            id lat, lon;
+            NSDate *date;
+            if([object objectForKey:@"_type"]) {
+                // OwnTracks
+                if(![[object objectForKey:@"_type"] isEqual:@"location"]) {
+                    return NO;
+                }
+                lat = [object objectForKey:@"lat"];
+                lon = [object objectForKey:@"lon"];
+                id tst = [object objectForKey:@"tst"];
+                date = [tst isKindOfClass:[NSNumber class]] ? [NSDate dateWithTimeIntervalSince1970:[tst doubleValue]] : nil;
+            } else {
+                NSDictionary *properties = [object objectForKey:@"properties"];
+                NSArray *coordinates = [[object objectForKey:@"geometry"] objectForKey:@"coordinates"];
+                if(![properties isKindOfClass:[NSDictionary class]] || [properties objectForKey:@"action"]
+                   || [[properties objectForKey:@"type"] isEqual:@"trip"]
+                   || ![coordinates isKindOfClass:[NSArray class]] || coordinates.count < 2) {
+                    return NO;
+                }
+                lon = coordinates[0];
+                lat = coordinates[1];
+                id timestamp = [properties objectForKey:@"timestamp"];
+                date = [timestamp isKindOfClass:[NSString class]] ? [formatter dateFromString:timestamp] : nil;
+            }
+            if(![lat isKindOfClass:[NSNumber class]] || ![lon isKindOfClass:[NSNumber class]] || date == nil) {
+                return NO;
+            }
+            CLLocationCoordinate2D coordinate = CLLocationCoordinate2DMake([lat doubleValue], [lon doubleValue]);
+            [keys addObject:key];
+            [locations addObject:[[CLLocation alloc] initWithCoordinate:coordinate altitude:0 horizontalAccuracy:0 verticalAccuracy:-1 timestamp:date]];
+            return NO;
+        }];
+    }];
+    callback(keys, locations);
+}
+
+
+- (void)requestAuthorizationPermission {
+    bool isFirstRequest = false;
+    if (@available(iOS 14.0, *)) {
+        if(self.locationManager.authorizationStatus == kCLAuthorizationStatusNotDetermined) {
+            isFirstRequest = true;
+        }
+    }
+    if(isFirstRequest) {
+        NSLog(@"Requesting WhenInUse Permission");
+        [self.locationManager requestWhenInUseAuthorization];
+    } else {
+        NSLog(@"Requesting Always Permission");
+        [self.locationManager requestAlwaysAuthorization];
+    }
+}
+
+
+#pragma mark - GLManager control (private)
+
+- (void)setupHTTPClient {
+    if(_httpSession == nil) {
+        _httpSession = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]];
+    }
+
+    NSMutableDictionary *headers = [NSMutableDictionary dictionary];
+    if(self.apiAccessToken != nil && ![@"" isEqualToString:self.apiAccessToken]) {
+        if(self.loggingModeCurrentValue == kGLLoggingModeOwntracks) {
+            headers[@"Authorization"] = [NSString stringWithFormat:@"Basic %@:", self.apiAccessToken];
+        } else {
+            headers[@"Authorization"] = [NSString stringWithFormat:@"Bearer %@", self.apiAccessToken];
+        }
+    }
+
+    // Apply custom headers
+    NSArray *customHeaders = [self customHeaders];
+    for (NSDictionary *header in customHeaders) {
+        NSString *key = header[@"key"];
+        NSString *value = header[@"value"];
+        if (key.length > 0 && value.length > 0 && ![GLManager isBlockedCustomHeaderName:key]) {
+            headers[key] = value;
+        }
+    }
+    _httpHeaders = [headers copy];
+
+    _deviceId = [self deviceId];
+}
+
+// Posts a JSON body and calls back on the main queue. Any 2xx status is a success, and
+// responseObject is the parsed JSON, or nil if the body is empty or isn't JSON.
+- (void)postJSON:(id)body toURL:(NSString *)urlString success:(void(^)(id _Nullable responseObject))success failure:(void(^)(NSString *errorMessage))failure {
+    NSURL *url = [NSURL URLWithString:urlString];
+    if(url == nil) {
+        failure(@"The server URL is not valid");
+        return;
+    }
+    // The current location and trip info are added to the body when sending, so they haven't
+    // been through the queue's serializer
+    body = [GLManager JSONSafeObject:body];
+    if(![NSJSONSerialization isValidJSONObject:body]) {
+        failure(@"The location data couldn't be converted to JSON");
+        return;
+    }
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPMethod = @"POST";
+    request.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    [request setValue:[self userAgent] forHTTPHeaderField:@"User-Agent"];
+    [_httpHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *value, BOOL *stop) {
+        [request setValue:value forHTTPHeaderField:key];
+    }];
+
+    NSURLSessionDataTask *task = [_httpSession dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSInteger statusCode = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : 0;
+        id responseObject = nil;
+        if(data.length > 0) {
+            responseObject = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if(error) {
+                failure(error.localizedDescription);
+            } else if(statusCode < 200 || statusCode > 299) {
+                failure([NSString stringWithFormat:@"The server responded with HTTP %ld (%@)", (long)statusCode, [NSHTTPURLResponse localizedStringForStatusCode:statusCode]]);
+            } else {
+                success(responseObject);
+            }
+        });
+    }];
+    [task resume];
+}
+
+// The same format AFNetworking used, e.g. "Overland/1.3 (iPhone; iOS 26.0; Scale/3.00)",
+// since servers may log or filter on it
+- (NSString *)userAgent {
+    NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
+    NSString *name = info[(__bridge NSString *)kCFBundleExecutableKey] ?: info[(__bridge NSString *)kCFBundleIdentifierKey];
+    NSString *version = info[@"CFBundleShortVersionString"] ?: info[(__bridge NSString *)kCFBundleVersionKey];
+    return [NSString stringWithFormat:@"%@/%@ (%@; iOS %@; Scale/%0.2f)", name, version, [[UIDevice currentDevice] model], [[UIDevice currentDevice] systemVersion], [self screenScale]];
+}
+
+// UIScreen.mainScreen is deprecated, and there's no window when the app is relaunched in the
+// background, so use the window scene's screen and remember its scale for those launches
+- (CGFloat)screenScale {
+    for(UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if([scene isKindOfClass:[UIWindowScene class]]) {
+            CGFloat scale = ((UIWindowScene *)scene).screen.scale;
+            [[NSUserDefaults standardUserDefaults] setDouble:scale forKey:GLScreenScaleDefaultsName];
+            return scale;
+        }
+    }
+    return [[NSUserDefaults standardUserDefaults] doubleForKey:GLScreenScaleDefaultsName];
+}
+
+- (void)restoreTrackingState {
+    if([[NSUserDefaults standardUserDefaults] boolForKey:GLTrackingStateDefaultsName]) {
+        [self enableTracking];
+        if(self.tripInProgress) {
+            // If a trip is in progress, open the trip DB now
+            [self.tripdb open];
+            // The cached distance doesn't survive a relaunch, so recalculate it from the DB
+            _currentTripHasNewData = YES;
+        }
+    } else {
+        [self disableTracking];
+    }
+
+    [self syncTripLiveActivity];
+}
+
+- (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager {
+    [[NSNotificationCenter defaultCenter] postNotificationName:GLAuthorizationStatusChangedNotification object:self];
+    NSLog(@"Location Authorization Changed: %@", self.authorizationStatusAsString);
+}
+
+- (void)enableTracking {
+    self.trackingEnabled = YES;
+
+    // Updates are starting again, so auto-stop starts watching from scratch
+    [[GLAutoStop shared] reset];
+
+    if(self.tripInProgress) {
+        self.locationManager.activityType = self.activityTypeDuringTrip;
+        self.locationManager.desiredAccuracy = self.desiredAccuracyDuringTrip;
+        self.locationManager.showsBackgroundLocationIndicator = self.showBackgroundLocationIndicatorDuringTrip;
+        self.locationManager.pausesLocationUpdatesAutomatically = self.pausesAutomaticallyDuringTrip;
+    } else {
+        self.locationManager.activityType = self.activityType;
+        self.locationManager.desiredAccuracy = self.desiredAccuracy;
+        self.locationManager.showsBackgroundLocationIndicator = self.showBackgroundLocationIndicator;
+        self.locationManager.pausesLocationUpdatesAutomatically = self.pausesAutomatically;
+    }
+
+    if(self.tripInProgress) {
+        NSLog(@"Monitoring standard location changes during trip");
+        [self.locationManager startUpdatingLocation];
+        [self.locationManager startUpdatingHeading];
+        [self.locationManager stopMonitoringSignificantLocationChanges];
+    } else {
+        switch(self.trackingMode) {
+            case kGLTrackingModeOff:
+                NSLog(@"Not monitoring continuous location");
+                [self.locationManager stopUpdatingLocation];
+                [self.locationManager stopUpdatingHeading];
+                [self.locationManager stopMonitoringSignificantLocationChanges];
+                break;
+            case kGLTrackingModeStandard:
+                NSLog(@"Monitoring standard location changes");
+                [self.locationManager startUpdatingLocation];
+                [self.locationManager startUpdatingHeading];
+                [self.locationManager stopMonitoringSignificantLocationChanges];
+                break;
+            case kGLTrackingModeSignificant:
+                NSLog(@"Monitoring significant location changes");
+                [self.locationManager startMonitoringSignificantLocationChanges];
+                [self.locationManager stopUpdatingLocation];
+                [self.locationManager stopUpdatingHeading];
+                break;
+            case kGLTrackingModeStandardAndSignificant:
+                NSLog(@"Monitoring both standard and significant location changes");
+                [self.locationManager startUpdatingLocation];
+                [self.locationManager startUpdatingHeading];
+                [self.locationManager startMonitoringSignificantLocationChanges];
+                break;
+        }
+    }
+    
+    if(self.visitTrackingEnabled) {
+        [self.locationManager startMonitoringVisits];
+    } else {
+        [self.locationManager stopMonitoringVisits];
+    }
+    
+    [UIDevice currentDevice].batteryMonitoringEnabled = YES;
+    
+    if(CMMotionActivityManager.isActivityAvailable) {
+        [self.motionActivityManager startActivityUpdatesToQueue:[NSOperationQueue mainQueue] withHandler:^(CMMotionActivity *activity) {
+            self.lastMotion = activity;
+            [[NSNotificationCenter defaultCenter] postNotificationName:GLNewActivityNotification object:self];
+        }];
+    }
+    [[GLBarometer shared] start];
+
+    NSLog(@"Location Authorization Status %@", self.authorizationStatusAsString);
+    
+    // Set the last location if location manager has a last location.
+    // This will be set for example when the app launches due to a signification location change,
+    // the locationmanager has a location already before a location event is delivered to the delegate.
+    if(self.locationManager.location) {
+        self.lastLocation = self.locationManager.location;
+    }
+    
+    [self scheduleLocalNotification];
+}
+
+- (void)disableTracking {
+    self.trackingEnabled = NO;
+    [UIDevice currentDevice].batteryMonitoringEnabled = NO;
+    [self.locationManager stopMonitoringVisits];
+    [self.locationManager stopUpdatingHeading];
+    [self.locationManager stopUpdatingLocation];
+    [self.locationManager stopMonitoringSignificantLocationChanges];
+    if(CMMotionActivityManager.isActivityAvailable) {
+        [self.motionActivityManager stopActivityUpdates];
+        self.lastMotion = nil;
+    }
+    [[GLBarometer shared] stop];
+    [self cancelLocalNotification];
+}
+
+- (void)sendingStarted {
+    self.sendInProgress = YES;
+    [[NSNotificationCenter defaultCenter] postNotificationName:GLSendingStartedNotification object:self];
+}
+
+- (void)sendingFinished {
+    [self sendingFinishedWithSentKeys:nil];
+}
+
+// The keys of the records that were sent go in the notification, for the map's unsent line
+- (void)sendingFinishedWithSentKeys:(NSSet *)sentKeys {
+    self.sendInProgress = NO;
+    NSDictionary *userInfo = sentKeys ? @{GLSentQueueKeysKey: [sentKeys allObjects]} : nil;
+    [[NSNotificationCenter defaultCenter] postNotificationName:GLSendingFinishedNotification object:self userInfo:userInfo];
+}
+
+- (void)sendQueueIfTimeElapsed {
+    // Local commits do not depend on network, Wi-Fi, server interval, or iCloud availability.
+    [self sendQueueNow];
+}
+
+- (void)sendQueueIfNotInProgress {
+    [self sendQueueNow];
+}
+
+#pragma mark - Scheduled local notifications
+
+- (void)scheduleLocalNotification {
+    // Schedule a local notification for 10 minutes into the future to remind the user to launch the app.
+    // We'll cancel the notification when we get an update from the system, so this should only
+    // run if the app is shut down for some reason.
+
+    // Auto-stop stopped updates on purpose, so there's nothing to remind about. Significant
+    // location changes still arrive here while it's stopped.
+    if([GLAutoStop shared].stopped) {
+        return;
+    }
+    
+    int scheduleRateLimit = 60;
+    int reminderIntervalSeconds = 600;
+    
+    // Only do this at most once a minute so we don't hammer the system with scheduled notification requests
+    NSDate *lastScheduled = self.lastScheduledNotificationDate;
+    if(lastScheduled != nil && [lastScheduled timeIntervalSinceNow] > -1 * scheduleRateLimit) {
+        return;
+    }
+    
+    [self cancelLocalNotification];
+    
+    UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+    content.title = [NSString localizedUserNotificationStringForKey:@"Overland" arguments:nil];
+    content.body = [NSString localizedUserNotificationStringForKey:@"Location updates were stopped. Launch the app to resume."
+                arguments:nil];
+    content.sound = [UNNotificationSound defaultSound];
+    
+    UNTimeIntervalNotificationTrigger* trigger = [UNTimeIntervalNotificationTrigger
+                triggerWithTimeInterval:reminderIntervalSeconds repeats:NO];
+    UNNotificationRequest* request = [UNNotificationRequest requestWithIdentifier:@"reminder"
+                content:content trigger:trigger];
+     
+    UNUserNotificationCenter* center = [UNUserNotificationCenter currentNotificationCenter];
+    [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
+        self.lastScheduledNotificationDate = NSDate.now;
+    }];
+}
+
+- (void)cancelLocalNotification {
+    // This makes a synchronous call to the notification service, so keep it off the main thread.
+    // Otherwise a slow or unresponsive service blocks app launch.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        UNUserNotificationCenter* center = [UNUserNotificationCenter currentNotificationCenter];
+        [center removePendingNotificationRequestsWithIdentifiers:@[@"reminder"]];
+    });
+}
+
+- (NSDate *)lastScheduledNotificationDate {
+    if([self defaultsKeyExists:GLLastScheduledNotificationDateDefaultsName]) {
+        return (NSDate *)[[NSUserDefaults standardUserDefaults] objectForKey:GLLastScheduledNotificationDateDefaultsName];
+    } else {
+        return nil;
+    }
+}
+- (void)setLastScheduledNotificationDate:(NSDate *)date {
+    [[NSUserDefaults standardUserDefaults] setObject:date forKey:GLLastScheduledNotificationDateDefaultsName];
+}
+
+
+#pragma mark - Trips
+
+- (BOOL)tripInProgress {
+    return [[NSUserDefaults standardUserDefaults] objectForKey:GLTripStartTimeDefaultsName] != nil;
+}
+
+- (NSString *)currentTripMode {
+    NSString *mode = [[NSUserDefaults standardUserDefaults] stringForKey:GLTripModeDefaultsName];
+    // A trip keeps its mode even if the mode is removed from the list during the trip
+    if(mode && self.tripInProgress) {
+        return mode;
+    }
+    if(![GLTripModeStore containsModeID:mode]) {
+        mode = GLTripModeStore.defaultModeID;
+    }
+    return mode;
+}
+
+- (void)setCurrentTripMode:(NSString *)mode {
+    [[NSUserDefaults standardUserDefaults] setObject:mode forKey:GLTripModeDefaultsName];
+    if(self.tripInProgress && self.liveActivityEnabled) {
+        [self updateTripLiveActivityForcingUpdate:YES];
+    }
+}
+
+- (NSDate *)currentTripStart {
+    if(!self.tripInProgress) {
+        return nil;
+    }
+    return (NSDate *)[[NSUserDefaults standardUserDefaults] objectForKey:GLTripStartTimeDefaultsName];
+}
+
+- (NSDate *)lastTripEndDate {
+    return (NSDate *)[[NSUserDefaults standardUserDefaults] objectForKey:GLLastTripEndDefaultsName];
+}
+
+- (NSTimeInterval)currentTripDuration {
+    if(!self.tripInProgress) {
+        return -1;
+    }
+    
+    NSDate *startDate = self.currentTripStart;
+    return [startDate timeIntervalSinceNow] * -1.0;
+}
+
+- (CLLocationDistance)currentTripDistance {
+    if(!self.tripInProgress) {
+        return -1;
+    }
+    
+    if(!_currentTripHasNewData) {
+        return _currentTripDistanceCached;
+    }
+
+    CLLocationDistance distance = [self tripDistanceUntil:nil];
+    _currentTripDistanceCached = distance;
+    _currentTripHasNewData = NO;
+    return distance;
+}
+
+// The trip's distance from its points up to endDate, or all of them if nil
+- (CLLocationDistance)tripDistanceUntil:(NSDate *)endDate {
+    CLLocationDistance distance = 0;
+    CLLocation *lastLocation;
+    CLLocation *loc;
+    
+    FMResultSet *s;
+    if(endDate) {
+        s = [self.tripdb executeQuery:@"SELECT latitude, longitude FROM trips WHERE timestamp <= ? ORDER BY timestamp", [NSNumber numberWithInt:[endDate timeIntervalSince1970]]];
+    } else {
+        s = [self.tripdb executeQuery:@"SELECT latitude, longitude FROM trips ORDER BY timestamp"];
+    }
+    while([s next]) {
+        loc = [[CLLocation alloc] initWithLatitude:[s doubleForColumnIndex:0] longitude:[s doubleForColumnIndex:1]];
+        
+        if(lastLocation) {
+            distance += [lastLocation distanceFromLocation:loc];
+        }
+        
+        lastLocation = loc;
+    }
+
+    return distance;
+}
+
+- (NSDictionary *)currentTripStartLocationDictionary {
+    if(!self.tripInProgress) {
+        self.tripStartLocationDictionary = nil;
+        return nil;
+    }
+    if(self.tripStartLocationDictionary == nil) {
+        NSDictionary *startLocation = (NSDictionary *)[[NSUserDefaults standardUserDefaults] objectForKey:GLTripStartLocationDefaultsName];
+        self.tripStartLocationDictionary = startLocation;
+    }
+    return self.tripStartLocationDictionary;
+}
+
+- (NSDictionary *)currentTripDictionary {
+    return @{
+            @"mode": [GLTripModeStore serverValueForModeID:self.currentTripMode],
+            @"start": [GLManager iso8601DateStringFromDate:self.currentTripStart],
+            @"distance": [NSNumber numberWithDouble:self.currentTripDistance],
+            @"start_location": (self.currentTripStartLocationDictionary ?: [NSNull null]),
+            @"current_location": (self.lastLocationDictionary ?: [NSNull null]),
+    };
+}
+
+- (void)startTrip {
+    if(self.tripInProgress) {
+        return;
+    }
+    
+    if(![GLWifiOnlySending shared].waitingForWifi) {
+        [self sendQueueNow];
+    }
+
+    [self.tripdb open];
+    _currentTripDistanceCached = 0;
+    _currentTripHasNewData = NO;
+    
+    NSDate *startDate = [NSDate date];
+    [[NSUserDefaults standardUserDefaults] setObject:startDate forKey:GLTripStartTimeDefaultsName];
+    
+    _storeNextLocationAsTripStart = YES;
+    NSLog(@"Store next location as trip start. Current trip start: %@", self.tripStartLocationDictionary);
+
+    [self startAllUpdates];
+
+    if(self.liveActivityEnabled) {
+        [self startTripLiveActivity];
+    }
+
+    NSLog(@"Started a trip at %@", startDate);
+    
+    [self incrementTripMode:self.currentTripMode];
+}
+
+- (void)endTrip {
+    [self endTripFromAutopause:NO];
+}
+
+- (void)endTripAtDate:(NSDate *)endDate location:(CLLocation *)location {
+    [self endTripAtDate:endDate location:location autopause:NO];
+}
+
+- (void)endTripFromAutopause:(BOOL)autopause {
+    [self endTripAtDate:nil location:nil autopause:autopause];
+}
+
+- (void)endTripAtDate:(NSDate *)endDate location:(CLLocation *)location autopause:(BOOL)autopause {
+    _storeNextLocationAsTripStart = NO;
+
+    // Restore locationManager settings to values not during a trip
+    self.locationManager.activityType = self.activityType;
+    self.locationManager.desiredAccuracy = self.desiredAccuracy;
+    self.locationManager.showsBackgroundLocationIndicator = self.showBackgroundLocationIndicator;
+    self.locationManager.pausesLocationUpdatesAutomatically = self.pausesAutomatically;
+
+    // The trip stays in progress until the pedometer query below finishes, so ignore
+    // a second request to end it (e.g. a double tap, or autopause and a manual end)
+    if(!self.tripInProgress || _tripEndInProgress) {
+        return;
+    }
+    _tripEndInProgress = YES;
+
+    if([CMPedometer isStepCountingAvailable]) {
+        [self.pedometer queryPedometerDataFromDate:self.currentTripStart toDate:(endDate ?: [NSDate date]) withHandler:^(CMPedometerData *pedometerData, NSError *error) {
+            // This handler runs on a background queue. Finish on the main queue, since location
+            // updates write to the trip database there and FMDatabase isn't thread-safe.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self finishEndingTrip:autopause pedometerData:pedometerData endDate:endDate location:location];
+            });
+        }];
+    } else {
+        [self finishEndingTrip:autopause pedometerData:nil endDate:endDate location:location];
+    }
+}
+
+- (void)finishEndingTrip:(BOOL)autopause pedometerData:(CMPedometerData *)pedometerData endDate:(NSDate *)endDate location:(CLLocation *)location {
+    [self endTripLiveActivity];
+    [self writeTripToDB:autopause pedometerData:pedometerData endDate:endDate location:location];
+    _tripEndInProgress = NO;
+
+    // Trips always use standard updates, so switch back to the tracking mode, such as significant
+    // changes only. Not when updates paused, since they stay paused until the phone moves, and
+    // not when tracking was turned off because it was off before the trip.
+    if(!autopause && self.trackingEnabled) {
+        [self enableTracking];
+    }
+
+    // Send after the trip record is written so it goes out with this batch
+    if(![GLWifiOnlySending shared].waitingForWifi) {
+        [self sendQueueNow];
+    }
+}
+
+- (void)incrementTripMode:(NSString *)tripMode {
+    NSMutableDictionary *currentStats = [[[NSUserDefaults standardUserDefaults] dictionaryForKey:GLTripModeStatsDefaultsName] mutableCopy];
+    if(currentStats == nil) {
+        currentStats = [[NSMutableDictionary alloc] init];
+    }
+    NSNumber *count = [currentStats valueForKey:tripMode];
+    NSNumber *newCount;
+    if(count != nil) {
+        newCount = [NSNumber numberWithInt:[count intValue] + 1];
+    } else {
+        newCount = @1;
+    }
+    [currentStats setValue:newCount forKey:tripMode];
+    [self tripModesByFrequency];
+    [[NSUserDefaults standardUserDefaults] setValue:currentStats forKey:GLTripModeStatsDefaultsName];
+}
+
+- (NSArray *)tripModesByFrequency {
+    NSDictionary *currentStats = [[NSUserDefaults standardUserDefaults] dictionaryForKey:GLTripModeStatsDefaultsName];
+    NSArray *tripModes = [currentStats keysSortedByValueUsingComparator:^NSComparisonResult(id  _Nonnull obj1, id  _Nonnull obj2) {
+        return [(NSNumber*)obj2 compare:(NSNumber*)obj1];
+    }];
+    return tripModes;
+}
+
+- (void)writeTripToDB:(BOOL)autopause pedometerData:(CMPedometerData *)pedometerData endDate:(NSDate *)endDate location:(CLLocation *)location {
+    NSInteger numberOfSteps = pedometerData ? [pedometerData.numberOfSteps integerValue] : 0;
+    // Without an end date the trip ends now, at the last location. With one, the end time,
+    // duration, distance and location are as of then.
+    NSDate *end = endDate ?: [NSDate date];
+    CLLocation *endLocation = location ?: self.lastLocation;
+    NSDictionary *endLocationDictionary = location ? [self currentDictionaryFromLocation:location] : self.lastLocationDictionary;
+    NSTimeInterval duration = endDate ? [endDate timeIntervalSinceDate:self.currentTripStart] : self.currentTripDuration;
+    CLLocationDistance distance = endDate ? [self tripDistanceUntil:endDate] : self.currentTripDistance;
+
+    [self.db accessCollection:GLLocationQueueName withBlock:^(id<LOLDatabaseAccessor> accessor) {
+        NSString *timestamp = [GLManager iso8601DateStringFromDate:end];
+        NSDictionary *currentTrip = @{
+                                      @"type": @"Feature",
+                                      @"geometry": @{
+                                              @"type": @"Point",
+                                              @"coordinates": @[
+                                                      [NSNumber numberWithDouble:endLocation.coordinate.longitude],
+                                                      [NSNumber numberWithDouble:endLocation.coordinate.latitude]
+                                                      ]
+                                              },
+                                      @"properties": [NSMutableDictionary dictionaryWithDictionary:@{
+                                              @"timestamp": timestamp,
+                                              @"type": @"trip",
+                                              @"mode": [GLTripModeStore serverValueForModeID:self.currentTripMode],
+                                              @"start": [GLManager iso8601DateStringFromDate:self.currentTripStart],
+                                              @"end": timestamp,
+                                              @"start_location": (self.tripStartLocationDictionary ?: [NSNull null]),
+                                              @"end_location":(endLocationDictionary ?: [NSNull null]),
+                                              @"duration": [NSNumber numberWithDouble:duration],
+                                              @"distance": [NSNumber numberWithDouble:distance],
+                                              @"stopped_automatically": @(autopause),
+                                              @"steps": [NSNumber numberWithInteger:numberOfSteps],
+                                              }]
+                                      };
+        // The mode's icon, so servers can show it: "icon" for the app's own icons, or "sf_symbol"
+        [currentTrip[@"properties"] addEntriesFromDictionary:[GLTripModeStore iconPropertiesForModeID:self.currentTripMode]];
+        // Only on phones that count floors
+        [currentTrip[@"properties"] setValue:pedometerData.floorsAscended forKey:@"floors_ascended"];
+        [currentTrip[@"properties"] setValue:pedometerData.floorsDescended forKey:@"floors_descended"];
+        [self addMetadataToUpdate:currentTrip];
+        if(autopause) {
+            [self notify:@"Trip ended automatically" withTitle:@"Tracker"];
+        }
+        [accessor setDictionary:currentTrip forKey:[NSString stringWithFormat:@"%@-trip",timestamp]];
+    }];
+
+    // Before the trip start is removed, since the Apple Health recorder reads this when it is
+    [[NSUserDefaults standardUserDefaults] setObject:end forKey:GLLastTripEndDefaultsName];
+
+    self.tripStartLocationDictionary = nil;
+    [[NSUserDefaults standardUserDefaults] setObject:nil forKey:GLTripStartTimeDefaultsName];
+    [[NSUserDefaults standardUserDefaults] setObject:nil forKey:GLTripStartLocationDefaultsName];
+
+    _currentTripDistanceCached = 0;
+    [self clearTripDB];
+    [self.tripdb close];
+    
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:GLTripStartTimeDefaultsName];
+    NSLog(@"Ended a %@ trip", self.currentTripMode);
+}
+
+#pragma mark - Properties
+
+- (CLLocationManager *)locationManager {
+    if (!_locationManager) {
+        _locationManager = [[CLLocationManager alloc] init];
+        _locationManager.delegate = self;
+        _locationManager.distanceFilter = kCLDistanceFilterNone;
+        _locationManager.allowsBackgroundLocationUpdates = YES;
+        if(self.tripInProgress) {
+            _locationManager.pausesLocationUpdatesAutomatically = self.pausesAutomaticallyDuringTrip;
+            _locationManager.desiredAccuracy = self.desiredAccuracyDuringTrip;
+            _locationManager.activityType = self.activityTypeDuringTrip;
+        } else {
+            _locationManager.pausesLocationUpdatesAutomatically = self.pausesAutomatically;
+            _locationManager.desiredAccuracy = self.desiredAccuracy;
+            _locationManager.activityType = self.activityType;
+        }
+    }
+    
+    return _locationManager;
+}
+
+- (CMMotionActivityManager *)motionActivityManager {
+    if (!_motionActivityManager) {
+        _motionActivityManager = [[CMMotionActivityManager alloc] init];
+    }
+    
+    return _motionActivityManager;
+}
+
+- (NSString *)currentBatteryState {
+    switch([UIDevice currentDevice].batteryState) {
+        case UIDeviceBatteryStateUnknown:
+            return @"unknown";
+        case UIDeviceBatteryStateCharging:
+            return @"charging";
+        case UIDeviceBatteryStateFull:
+            return @"full";
+        case UIDeviceBatteryStateUnplugged:
+            return @"unplugged";
+    }
+}
+
+- (NSNumber *)currentBatteryLevel {
+    return [NSNumber numberWithDouble:((int)([UIDevice currentDevice].batteryLevel * 100)) / 100.0];
+}
+
+- (NSString *)authorizationStatusAsString {
+    if (@available(iOS 14.0, *)) {
+        switch(self.locationManager.authorizationStatus) {
+            case kCLAuthorizationStatusNotDetermined:
+                return @"Not Determined";
+            case kCLAuthorizationStatusRestricted:
+                return @"Restricted";
+            case kCLAuthorizationStatusDenied:
+                return @"Denied";
+            case kCLAuthorizationStatusAuthorizedWhenInUse:
+                return @"When in Use";
+            case kCLAuthorizationStatusAuthorizedAlways:
+                return @"Always";
+        }
+    } else {
+        return @"Unknown";
+    }
+}
+
+- (BOOL)shouldConsiderHTTP200Success {
+    NSUserDefaults *standardUserDefaults = [NSUserDefaults standardUserDefaults];
+    return [standardUserDefaults boolForKey:GLConsiderHTTP200SuccessDefaultsName];
+}
+
+- (CLLocationDistance)resumesAfterDistance {
+    if([self defaultsKeyExists:GLResumesAutomaticallyDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] doubleForKey:GLResumesAutomaticallyDefaultsName];
+    } else {
+        return -1;
+    }
+}
+- (void)setResumesAfterDistance:(CLLocationDistance)resumesAfterDistance {
+    [[NSUserDefaults standardUserDefaults] setDouble:resumesAfterDistance forKey:GLResumesAutomaticallyDefaultsName];
+}
+
+- (CLLocationDistance)discardPointsWithinDistance {
+    if([self defaultsKeyExists:GLDiscardPointsWithinDistanceDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] doubleForKey:GLDiscardPointsWithinDistanceDefaultsName];
+    } else {
+        return -1;
+    }
+}
+- (void)setDiscardPointsWithinDistance:(CLLocationDistance)distance {
+    [[NSUserDefaults standardUserDefaults] setDouble:distance forKey:GLDiscardPointsWithinDistanceDefaultsName];
+}
+
+- (CLLocationDistance)discardPointsWithinDistanceDuringTrip {
+    if([self defaultsKeyExists:GLTripDiscardPointsWithinDistanceDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] doubleForKey:GLTripDiscardPointsWithinDistanceDefaultsName];
+    } else {
+        return -1;
+    }
+}
+- (void)setDiscardPointsWithinDistanceDuringTrip:(CLLocationDistance)distance {
+    [[NSUserDefaults standardUserDefaults] setDouble:distance forKey:GLTripDiscardPointsWithinDistanceDefaultsName];
+}
+
+- (CLLocationDistance)discardPointsWithinDistanceCurrentValue {
+    if(self.tripInProgress) {
+        return self.discardPointsWithinDistanceDuringTrip;
+    } else {
+        return self.discardPointsWithinDistance;
+    }
+}
+
+- (int)discardPointsWithinSeconds {
+    if([self defaultsKeyExists:GLDiscardPointsWithinSecondsDefaultsName]) {
+        return (int)[[NSUserDefaults standardUserDefaults] integerForKey:GLDiscardPointsWithinSecondsDefaultsName];
+    } else {
+        return 1;
+    }
+}
+- (void)setDiscardPointsWithinSeconds:(int)seconds {
+    [[NSUserDefaults standardUserDefaults] setInteger:seconds forKey:GLDiscardPointsWithinSecondsDefaultsName];
+}
+
+- (int)discardPointsWithinSecondsDuringTrip {
+    if([self defaultsKeyExists:GLTripDiscardPointsWithinSecondsDefaultsName]) {
+        return (int)[[NSUserDefaults standardUserDefaults] integerForKey:GLTripDiscardPointsWithinSecondsDefaultsName];
+    } else {
+        return 1;
+    }
+}
+- (void)setDiscardPointsWithinSecondsDuringTrip:(int)seconds {
+    [[NSUserDefaults standardUserDefaults] setInteger:seconds forKey:GLTripDiscardPointsWithinSecondsDefaultsName];
+}
+
+- (int)discardPointsWithinSecondsCurrentValue {
+    if(self.tripInProgress) {
+        return self.discardPointsWithinSecondsDuringTrip;
+    } else {
+        return self.discardPointsWithinSeconds;
+    }
+}
+
+- (BOOL)discardPointsWithoutGPS {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:GLDiscardPointsWithoutGPSDefaultsName];
+}
+- (void)setDiscardPointsWithoutGPS:(BOOL)discard {
+    [[NSUserDefaults standardUserDefaults] setBool:discard forKey:GLDiscardPointsWithoutGPSDefaultsName];
+}
+
+- (BOOL)discardPointsWithoutGPSDuringTrip {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:GLTripDiscardPointsWithoutGPSDefaultsName];
+}
+- (void)setDiscardPointsWithoutGPSDuringTrip:(BOOL)discard {
+    [[NSUserDefaults standardUserDefaults] setBool:discard forKey:GLTripDiscardPointsWithoutGPSDefaultsName];
+}
+
+- (BOOL)discardPointsWithoutGPSCurrentValue {
+    if(self.tripInProgress) {
+        return self.discardPointsWithoutGPSDuringTrip;
+    } else {
+        return self.discardPointsWithoutGPS;
+    }
+}
+
+- (CLLocationAccuracy)discardPointsWorseThanAccuracy {
+    if([self defaultsKeyExists:GLDiscardPointsWorseThanAccuracyDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] doubleForKey:GLDiscardPointsWorseThanAccuracyDefaultsName];
+    } else {
+        return -1;
+    }
+}
+- (void)setDiscardPointsWorseThanAccuracy:(CLLocationAccuracy)accuracy {
+    [[NSUserDefaults standardUserDefaults] setDouble:accuracy forKey:GLDiscardPointsWorseThanAccuracyDefaultsName];
+}
+
+- (CLLocationAccuracy)discardPointsWorseThanAccuracyDuringTrip {
+    if([self defaultsKeyExists:GLTripDiscardPointsWorseThanAccuracyDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] doubleForKey:GLTripDiscardPointsWorseThanAccuracyDefaultsName];
+    } else {
+        return -1;
+    }
+}
+- (void)setDiscardPointsWorseThanAccuracyDuringTrip:(CLLocationAccuracy)accuracy {
+    [[NSUserDefaults standardUserDefaults] setDouble:accuracy forKey:GLTripDiscardPointsWorseThanAccuracyDefaultsName];
+}
+
+- (CLLocationAccuracy)discardPointsWorseThanAccuracyCurrentValue {
+    if(self.tripInProgress) {
+        return self.discardPointsWorseThanAccuracyDuringTrip;
+    } else {
+        return self.discardPointsWorseThanAccuracy;
+    }
+}
+
+- (BOOL)discardPointsWhileStationary {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:GLDiscardPointsWhileStationaryDefaultsName];
+}
+- (void)setDiscardPointsWhileStationary:(BOOL)discard {
+    [[NSUserDefaults standardUserDefaults] setBool:discard forKey:GLDiscardPointsWhileStationaryDefaultsName];
+}
+
+- (BOOL)discardPointsWhileStationaryDuringTrip {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:GLTripDiscardPointsWhileStationaryDefaultsName];
+}
+- (void)setDiscardPointsWhileStationaryDuringTrip:(BOOL)discard {
+    [[NSUserDefaults standardUserDefaults] setBool:discard forKey:GLTripDiscardPointsWhileStationaryDefaultsName];
+}
+
+- (BOOL)discardPointsWhileStationaryCurrentValue {
+    if(self.tripInProgress) {
+        return self.discardPointsWhileStationaryDuringTrip;
+    } else {
+        return self.discardPointsWhileStationary;
+    }
+}
+
+
+#pragma mark CLLocationManager
+
+- (NSSet *)monitoredRegions {
+    return self.locationManager.monitoredRegions;
+}
+
+- (BOOL)pausesAutomatically {
+    if([self defaultsKeyExists:GLPausesAutomaticallyDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] boolForKey:GLPausesAutomaticallyDefaultsName];
+    } else {
+        return NO;
+    }
+}
+- (void)setPausesAutomatically:(BOOL)pausesAutomatically {
+    BOOL prevValue = self.pausesAutomatically;
+    if(prevValue != pausesAutomatically) {
+        [[NSUserDefaults standardUserDefaults] setBool:pausesAutomatically forKey:GLPausesAutomaticallyDefaultsName];
+        if(!self.tripInProgress) {
+            NSLog(@"Setting pausesLocationUpdatesAutomatically %d", pausesAutomatically);
+            self.locationManager.pausesLocationUpdatesAutomatically = pausesAutomatically;
+        }
+    }
+}
+
+- (BOOL)pausesAutomaticallyDuringTrip {
+    if([self defaultsKeyExists:GLTripPausesAutomaticallyDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] boolForKey:GLTripPausesAutomaticallyDefaultsName];
+    } else {
+        return NO;
+    }
+}
+- (void)setPausesAutomaticallyDuringTrip:(BOOL)pausesAutomatically {
+    BOOL prevValue = self.pausesAutomaticallyDuringTrip;
+    if(prevValue != pausesAutomatically) {
+        [[NSUserDefaults standardUserDefaults] setBool:pausesAutomatically forKey:GLTripPausesAutomaticallyDefaultsName];
+        if(self.tripInProgress) {
+            NSLog(@"Setting pausesLocationUpdatesAutomatically while trip is in progress %d", pausesAutomatically);
+            self.locationManager.pausesLocationUpdatesAutomatically = pausesAutomatically;
+        }
+    }
+}
+
+- (BOOL)includeTrackingStats {
+    if([self defaultsKeyExists:GLIncludeTrackingStatsDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] boolForKey:GLIncludeTrackingStatsDefaultsName];
+    } else {
+        return NO;
+    }
+}
+- (void)setIncludeTrackingStats:(BOOL)enabled {
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:GLIncludeTrackingStatsDefaultsName];
+}
+
+- (GLTrackingMode)trackingMode {
+    if([self defaultsKeyExists:GLSignificantLocationModeDefaultsName]) {
+        return (int)[[NSUserDefaults standardUserDefaults] integerForKey:GLSignificantLocationModeDefaultsName];
+    } else {
+        return kGLTrackingModeStandard;
+    }
+}
+- (void)setTrackingMode:(GLTrackingMode)trackingMode {
+    GLTrackingMode previousTrackingMode = self.trackingMode;
+    if(previousTrackingMode != trackingMode) {
+        [[NSUserDefaults standardUserDefaults] setInteger:trackingMode forKey:GLSignificantLocationModeDefaultsName];
+        [self enableTracking];
+    }
+}
+
+- (BOOL)visitTrackingEnabled {
+    if([self defaultsKeyExists:GLVisitTrackingEnabledDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] boolForKey:GLVisitTrackingEnabledDefaultsName];
+    } else {
+        return NO;
+    }
+}
+- (void)setVisitTrackingEnabled:(BOOL)enabled {
+    BOOL previousEnabled = self.visitTrackingEnabled;
+    if(previousEnabled != enabled) {
+        [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:GLVisitTrackingEnabledDefaultsName];
+        [self enableTracking];
+    }
+}
+
+- (GLLoggingMode)loggingMode {
+    if([self defaultsKeyExists:GLLoggingModeDefaultsName]) {
+        return (int)[[NSUserDefaults standardUserDefaults] integerForKey:GLLoggingModeDefaultsName];
+    } else {
+        return kGLLoggingModeAllData;
+    }
+}
+- (void)setLoggingMode:(GLLoggingMode)loggingMode {
+    GLLoggingMode previousLoggingMode = self.loggingMode;
+    if(previousLoggingMode != loggingMode) {
+        [[NSUserDefaults standardUserDefaults] setInteger:loggingMode forKey:GLLoggingModeDefaultsName];
+        [self setupHTTPClient];
+    }
+}
+
+- (GLLoggingMode)loggingModeDuringTrip {
+    if([self defaultsKeyExists:GLTripLoggingModeDefaultsName]) {
+        return (int)[[NSUserDefaults standardUserDefaults] integerForKey:GLTripLoggingModeDefaultsName];
+    } else {
+        return kGLLoggingModeAllData;
+    }
+}
+- (void)setLoggingModeDuringTrip:(GLLoggingMode)loggingMode {
+    [[NSUserDefaults standardUserDefaults] setInteger:loggingMode forKey:GLTripLoggingModeDefaultsName];
+}
+
+- (GLLoggingMode)loggingModeCurrentValue {
+    if(self.tripInProgress) {
+        return self.loggingModeDuringTrip;
+    } else {
+        return self.loggingMode;
+    }
+}
+
+- (BOOL)showBackgroundLocationIndicator {
+    if([self defaultsKeyExists:GLBackgroundIndicatorDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] boolForKey:GLBackgroundIndicatorDefaultsName];
+    } else {
+        return NO;
+    }
+}
+- (void)setShowBackgroundLocationIndicator:(BOOL)mode {
+    BOOL previousMode = self.showBackgroundLocationIndicator;
+    if(previousMode != mode) {
+        [[NSUserDefaults standardUserDefaults] setBool:mode forKey:GLBackgroundIndicatorDefaultsName];
+        if(self.trackingEnabled && !self.tripInProgress) {
+            self.locationManager.showsBackgroundLocationIndicator = mode;
+        }
+    }
+}
+
+- (BOOL)showBackgroundLocationIndicatorDuringTrip {
+    if([self defaultsKeyExists:GLTripBackgroundIndicatorDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] boolForKey:GLTripBackgroundIndicatorDefaultsName];
+    } else {
+        return YES;
+    }
+}
+- (void)setShowBackgroundLocationIndicatorDuringTrip:(BOOL)mode {
+    BOOL previousMode = self.showBackgroundLocationIndicatorDuringTrip;
+    if(previousMode != mode) {
+        [[NSUserDefaults standardUserDefaults] setBool:mode forKey:GLTripBackgroundIndicatorDefaultsName];
+        if(self.tripInProgress) {
+            self.locationManager.showsBackgroundLocationIndicator = mode;
+        }
+    }
+}
+
+- (CLActivityType)activityType {
+    if([self defaultsKeyExists:GLActivityTypeDefaultsName]) {
+        // Map back to CLActivityType constants
+        long activityInt = [[NSUserDefaults standardUserDefaults] integerForKey:GLActivityTypeDefaultsName];
+        CLActivityType activityType;
+        switch(activityInt) {
+            case 1:
+                activityType = CLActivityTypeOther;
+                break;
+            case 2:
+                activityType = CLActivityTypeAutomotiveNavigation;
+                break;
+            case 3:
+                activityType = CLActivityTypeFitness;
+                break;
+            case 4:
+                activityType = CLActivityTypeOtherNavigation;
+                break;
+            case 5:
+                if (@available(iOS 12.0, *)) {
+                    activityType = CLActivityTypeAirborne;
+                } else {
+                    activityType = CLActivityTypeOther;
+                }
+                break;
+            case 6:
+                if (@available(iOS 27.0, *)) {
+                    activityType = CLActivityTypeMaritime;
+                } else {
+                    activityType = CLActivityTypeOther;
+                }
+                break;
+            default:
+                activityType = CLActivityTypeOther;
+                break;
+        }
+        return activityType;
+    } else {
+        return CLActivityTypeOther;
+    }
+}
+- (void)setActivityType:(CLActivityType)activityType {
+    // Store these as integers, in the same order as the UI control
+    int activityInt;
+    switch(activityType) {
+        case CLActivityTypeOther:
+            activityInt = 1;
+            break;
+        case CLActivityTypeAutomotiveNavigation:
+            activityInt = 2;
+            break;
+        case CLActivityTypeFitness:
+            activityInt = 3;
+            break;
+        case CLActivityTypeOtherNavigation:
+            activityInt = 4;
+            break;
+        case CLActivityTypeAirborne:
+            if (@available(iOS 12.0, *)) {
+                activityInt = 5;
+            } else {
+                activityInt = 1;
+            }
+            break;
+        default:
+            if (@available(iOS 27.0, *)) {
+                if(activityType == CLActivityTypeMaritime) {
+                    activityInt = 6;
+                    break;
+                }
+            }
+            // Types the settings screen doesn't offer
+            activityInt = 1;
+            break;
+    }
+    [[NSUserDefaults standardUserDefaults] setInteger:activityInt forKey:GLActivityTypeDefaultsName];
+    self.locationManager.activityType = activityType;
+}
+
+- (CLActivityType)activityTypeDuringTrip {
+    if([self defaultsKeyExists:GLTripActivityTypeDefaultsName]) {
+        // Map back to CLActivityType constants
+        long activityInt = [[NSUserDefaults standardUserDefaults] integerForKey:GLTripActivityTypeDefaultsName];
+        CLActivityType activityType;
+        switch(activityInt) {
+            case 1:
+                activityType = CLActivityTypeOther;
+                break;
+            case 2:
+                activityType = CLActivityTypeAutomotiveNavigation;
+                break;
+            case 3:
+                activityType = CLActivityTypeFitness;
+                break;
+            case 4:
+                activityType = CLActivityTypeOtherNavigation;
+                break;
+            case 5:
+                if (@available(iOS 12.0, *)) {
+                    activityType = CLActivityTypeAirborne;
+                } else {
+                    activityType = CLActivityTypeOther;
+                }
+                break;
+            case 6:
+                if (@available(iOS 27.0, *)) {
+                    activityType = CLActivityTypeMaritime;
+                } else {
+                    activityType = CLActivityTypeOther;
+                }
+                break;
+            default:
+                activityType = CLActivityTypeOther;
+                break;
+        }
+        return activityType;
+    } else {
+        return CLActivityTypeOther;
+    }
+}
+- (void)setActivityTypeDuringTrip:(CLActivityType)activityType {
+    // Store these as integers, in the same order as the UI control
+    int activityInt;
+    switch(activityType) {
+        case CLActivityTypeOther:
+            activityInt = 1;
+            break;
+        case CLActivityTypeAutomotiveNavigation:
+            activityInt = 2;
+            break;
+        case CLActivityTypeFitness:
+            activityInt = 3;
+            break;
+        case CLActivityTypeOtherNavigation:
+            activityInt = 4;
+            break;
+        case CLActivityTypeAirborne:
+            if (@available(iOS 12.0, *)) {
+                activityInt = 5;
+            } else {
+                activityInt = 1;
+            }
+            break;
+        default:
+            if (@available(iOS 27.0, *)) {
+                if(activityType == CLActivityTypeMaritime) {
+                    activityInt = 6;
+                    break;
+                }
+            }
+            // Types the settings screen doesn't offer
+            activityInt = 1;
+            break;
+    }
+    [[NSUserDefaults standardUserDefaults] setInteger:activityInt forKey:GLTripActivityTypeDefaultsName];
+}
+
+- (CLLocationAccuracy)desiredAccuracy {
+    if([self defaultsKeyExists:GLDesiredAccuracyDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] doubleForKey:GLDesiredAccuracyDefaultsName];
+    } else {
+        return kCLLocationAccuracyHundredMeters;
+    }
+}
+- (void)setDesiredAccuracy:(CLLocationAccuracy)desiredAccuracy {
+    [[NSUserDefaults standardUserDefaults] setDouble:desiredAccuracy forKey:GLDesiredAccuracyDefaultsName];
+    if(!self.tripInProgress) {
+        self.locationManager.desiredAccuracy = desiredAccuracy;
+    }
+}
+
+- (CLLocationAccuracy)desiredAccuracyDuringTrip {
+    if([self defaultsKeyExists:GLTripDesiredAccuracyDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] doubleForKey:GLTripDesiredAccuracyDefaultsName];
+    } else {
+        return kCLLocationAccuracyHundredMeters;
+    }
+}
+- (void)setDesiredAccuracyDuringTrip:(CLLocationAccuracy)desiredAccuracy {
+    [[NSUserDefaults standardUserDefaults] setDouble:desiredAccuracy forKey:GLTripDesiredAccuracyDefaultsName];
+    if(self.tripInProgress) {
+        self.locationManager.desiredAccuracy = desiredAccuracy;
+    }
+}
+
+- (int)pointsPerBatch {
+    if([self defaultsKeyExists:GLPointsPerBatchDefaultsName]) {
+        return (int)[[NSUserDefaults standardUserDefaults] integerForKey:GLPointsPerBatchDefaultsName];
+    } else {
+        return 200;
+    }
+}
+- (void)setPointsPerBatch:(int)points {
+    [[NSUserDefaults standardUserDefaults] setInteger:points forKey:GLPointsPerBatchDefaultsName];
+}
+
+- (int)pointsPerBatchDuringTrip {
+    if([self defaultsKeyExists:GLTripPointsPerBatchDefaultsName]) {
+        return (int)[[NSUserDefaults standardUserDefaults] integerForKey:GLTripPointsPerBatchDefaultsName];
+    } else {
+        return 200;
+    }
+}
+- (void)setPointsPerBatchDuringTrip:(int)points {
+    [[NSUserDefaults standardUserDefaults] setInteger:points forKey:GLTripPointsPerBatchDefaultsName];
+}
+
+- (int)pointsPerBatchCurrentValue {
+    if(self.tripInProgress) {
+        return self.pointsPerBatchDuringTrip;
+    } else {
+        return self.pointsPerBatch;
+    }
+}
+
+#pragma mark GLManager
+
+- (NSNumber *)sendingInterval {
+    if(_sendingInterval)
+        return _sendingInterval;
+    
+    _sendingInterval = (NSNumber *)[[NSUserDefaults standardUserDefaults] valueForKey:GLSendIntervalDefaultsName];
+    if(_sendingInterval == nil) {
+        _sendingInterval = [NSNumber numberWithInteger:300];
+    }
+    return _sendingInterval;
+}
+
+- (void)setSendingInterval:(NSNumber *)newValue {
+    [[NSUserDefaults standardUserDefaults] setValue:newValue forKey:GLSendIntervalDefaultsName];
+    _sendingInterval = newValue;
+}
+
+- (NSDate *)lastSentDate {
+    return (NSDate *)[[NSUserDefaults standardUserDefaults] objectForKey:GLLastSentDateDefaultsName];
+}
+
+- (void)setLastSentDate:(NSDate *)lastSentDate {
+    [[NSUserDefaults standardUserDefaults] setObject:lastSentDate forKey:GLLastSentDateDefaultsName];
+}
+
+#pragma mark - CLLocationManager Delegate Methods
+
+- (void)locationManager:(CLLocationManager *)manager didVisit:(CLVisit *)visit {
+
+    if(self.visitTrackingEnabled) {
+        [[NSNotificationCenter defaultCenter] postNotificationName:GLNewDataNotification object:self];
+        [self.db accessCollection:GLLocationQueueName withBlock:^(id<LOLDatabaseAccessor> accessor) {
+            NSString *timestamp = [GLManager iso8601DateStringFromDate:[NSDate date]];
+            NSDictionary *update = @{
+                                      @"type": @"Feature",
+                                      @"geometry": @{
+                                              @"type": @"Point",
+                                              @"coordinates": @[
+                                                      [NSNumber numberWithDouble:visit.coordinate.longitude],
+                                                      [NSNumber numberWithDouble:visit.coordinate.latitude]
+                                                      ]
+                                              },
+                                      @"properties": [NSMutableDictionary dictionaryWithDictionary:@{
+                                              @"timestamp": timestamp,
+                                              @"action": @"visit",
+                                              @"arrival_date": ([visit.arrivalDate isEqualToDate:[NSDate distantPast]] ? [NSNull null] : [GLManager iso8601DateStringFromDate:visit.arrivalDate]),
+                                              @"departure_date": ([visit.departureDate isEqualToDate:[NSDate distantFuture]] ? [NSNull null] : [GLManager iso8601DateStringFromDate:visit.departureDate]),
+                                              @"horizontal_accuracy": [NSNumber numberWithInt:visit.horizontalAccuracy],
+                                              }]
+                                    };
+            [self addMetadataToUpdate:update];
+            [accessor setDictionary:update forKey:[NSString stringWithFormat:@"%@-visit", timestamp]];
+        }];
+
+    }
+    
+    // If a trip is active, ask if they would like to end the trip. Not when "Ask to End Trip When
+    // Stopped" is on, which sends its own prompt for the same stop.
+    if(self.tripInProgress && ![[NSUserDefaults standardUserDefaults] boolForKey:GLTripAskToEndWhenStoppedDefaultsName]) {
+        [self askToEndTrip];
+    }
+    
+    [self sendQueueIfTimeElapsed];
+}
+
+- (void)deleteAllData {
+    [self.db accessCollection:GLLocationQueueName withBlock:^(id<LOLDatabaseAccessor> accessor) {
+        [accessor deleteAllData];
+    }];
+}
+
+- (void)locationManager:(CLLocationManager *)manager didUpdateLocations:(NSArray *)locations {
+    
+    if(self.trackingMode == kGLTrackingModeOff) {
+        // This probably shouldn't happen, but just in case, don't log anything if they have tracking mode set to off
+        return;
+    }
+
+    // A wifi zone can replace these locations, so look up the current wifi network first.
+    // The lookup is asynchronous and calls back on the main queue.
+    [GLManager refreshCurrentWifiHotSpotName:^(NSString *wifiName) {
+        [self processNewLocations:locations];
+    }];
+}
+
+- (void)processNewLocations:(NSArray *)locations {
+    self.lastDeviceLocation = [locations lastObject];
+
+    // If a wifi override is configured, replace the input location list with the location in the wifi mapping
+    if([GLManager currentWifiHotSpotName]) {
+        CLLocation *wifiLocation = [self currentLocationFromWifiName:[GLManager currentWifiHotSpotName] bssid:[GLManager currentWifiBSSID]];
+        if(wifiLocation) {
+            locations = @[wifiLocation];
+        }
+    }
+    
+    // NSLog(@"Received %d locations", (int)locations.count);
+    
+    // NSLog(@"%@", locations);
+    
+    NSString *activityType = @"";
+    switch([GLManager sharedManager].activityType) {
+        case CLActivityTypeOther:
+            activityType = @"other";
+            break;
+        case CLActivityTypeAutomotiveNavigation:
+            activityType = @"automotive_navigation";
+            break;
+        case CLActivityTypeFitness:
+            activityType = @"fitness";
+            break;
+        case CLActivityTypeOtherNavigation:
+            activityType = @"other_navigation";
+            break;
+        case CLActivityTypeAirborne:
+            activityType = @"airborne";
+            break;
+        default:
+            activityType = @"other";
+            if (@available(iOS 27.0, *)) {
+                if([GLManager sharedManager].activityType == CLActivityTypeMaritime) {
+                    activityType = @"maritime";
+                }
+            }
+            break;
+    }
+    
+    CLLocation *lastLocationSeen = self.lastLocation; // Grab the last known location from the previous batch
+    
+    int startIndex = 0;
+    if(self.loggingModeCurrentValue == kGLLoggingModeOnlyLatest || self.loggingModeCurrentValue == kGLLoggingModeOwntracks) {
+        // Only grab the latest point in this batch
+        startIndex = ((int)locations.count) - 1;
+    }
+    
+    BOOL didAddData = NO;
+    // The points added to the queue, for the map's path lines
+    NSMutableArray *addedLocations = [NSMutableArray array];
+    NSMutableArray *addedKeys = [NSMutableArray array];
+
+    for(int i=startIndex; i<locations.count; i++) {
+        CLLocation *loc = locations[i];
+
+        // Drop points less accurate than the setting, such as ones from cell tower positioning.
+        // A negative accuracy means the location is invalid.
+        CLLocationAccuracy maxAccuracy = self.discardPointsWorseThanAccuracyCurrentValue;
+        if(maxAccuracy > 0 && (loc.horizontalAccuracy < 0 || loc.horizontalAccuracy > maxAccuracy)) {
+            continue;
+        }
+        
+        // If Discard is enabled, check if this point is too close to the previous
+        if(self.discardPointsWithinDistanceCurrentValue > 0) {
+            CLLocationDistance distanceBetweenPoints = [lastLocationSeen distanceFromLocation:loc];
+            if(distanceBetweenPoints < self.discardPointsWithinDistanceCurrentValue) {
+                // NSLog(@"Discarding location because this point is too close to the previous: %f", distanceBetweenPoints);
+                continue;
+            }
+        }
+
+        // iOS doesn't say whether a point came from GPS, but points from wifi or cell tower
+        // positioning have neither an altitude nor a speed
+        if(self.discardPointsWithoutGPSCurrentValue && loc.verticalAccuracy < 0 && loc.speed < 0) {
+            continue;
+        }
+
+        if(self.discardPointsWithinSecondsCurrentValue > 1) {
+            int timeInterval = (int)[loc.timestamp timeIntervalSinceDate:lastLocationSeen.timestamp];
+            if(timeInterval < self.discardPointsWithinSecondsCurrentValue) {
+                continue;
+            }
+        }
+
+        // Drop points while the phone is sitting still, which avoids collecting GPS drift overnight.
+        // Keep the first point after stopping, so the server knows where the phone stopped, and then
+        // one point an hour. Only real movement ends the stop, since motion readings often flicker
+        // between stationary and unknown while the phone is still.
+        if(!self.discardPointsWhileStationaryCurrentValue || [self deviceIsMoving]) {
+            _inStationaryStop = NO;
+        } else if(_inStationaryStop) {
+            // Unknown and low-confidence readings land here too, so they don't end the stop
+            if([loc.timestamp timeIntervalSinceDate:_lastStationaryPointDate] < GLStationaryHeartbeatInterval) {
+                continue;
+            }
+            _lastStationaryPointDate = loc.timestamp;
+        } else if([self deviceIsStationary]) {
+            _inStationaryStop = YES;
+            _lastStationaryPointDate = loc.timestamp;
+        }
+        
+        NSString *timestamp = [GLManager iso8601DateStringFromDate:loc.timestamp];
+        NSDictionary *update;
+        if(self.usesOwntracksFormat) {
+            update = [self owntracksDictionaryFromLocation:loc];
+        } else {
+            update = [self currentDictionaryFromLocation:loc];
+            NSMutableDictionary *properties = [update objectForKey:@"properties"];
+            if(self.includeTrackingStats) {
+                [properties setValue:[NSNumber numberWithBool:self.locationManager.pausesLocationUpdatesAutomatically] forKey:@"pauses"];
+                [properties setValue:activityType forKey:@"activity"];
+                [properties setValue:[NSNumber numberWithDouble:self.locationManager.desiredAccuracy] forKey:@"desired_accuracy"];
+                [properties setValue:[NSNumber numberWithInt:self.trackingMode] forKey:@"tracking_mode"];
+                // Placeholder, replaced with the size of the batch in sendQueueNow
+                [properties setValue:@1 forKey:@"locations_in_payload"];
+            }
+            // Add the trip start time as trip_id, and the current trip mode, in the location update
+            if(self.tripInProgress) {
+                [properties setValue:[GLManager iso8601DateStringFromDate:self.currentTripStart] forKey:@"trip_id"];
+                [properties setValue:[GLTripModeStore serverValueForModeID:self.currentTripMode] forKey:@"trip_mode"];
+            }
+        }
+
+        // Queue the point in the database
+        [self.db accessCollection:GLLocationQueueName withBlock:^(id<LOLDatabaseAccessor> accessor) {
+            if(self.loggingModeCurrentValue == kGLLoggingModeOnlyLatest || self.loggingModeCurrentValue == kGLLoggingModeOwntracks) {
+                // Delete everything in the DB so that this new point is the only one in the queue after it's added below
+                [accessor deleteAllData];
+            }
+            [accessor setDictionary:update forKey:timestamp];
+        }];
+        didAddData = YES;
+        [addedLocations addObject:loc];
+        [addedKeys addObject:timestamp];
+        
+        if([loc.timestamp timeIntervalSinceDate:self.currentTripStart] >= 0  // only if the location is newer than the trip start
+           && loc.horizontalAccuracy <= 200 // only if the location is accurate enough
+           ) {
+
+            if(_storeNextLocationAsTripStart) {
+                [[NSUserDefaults standardUserDefaults] setObject:update forKey:GLTripStartLocationDefaultsName];
+                self.tripStartLocationDictionary = update;
+                _storeNextLocationAsTripStart = NO;
+            }
+            
+            // If a trip is in progress, add to the trip's list too (for calculating trip distance)
+            if(self.tripInProgress) {
+                [self.tripdb executeUpdate:@"INSERT INTO trips (timestamp, latitude, longitude) VALUES (?, ?, ?)", [NSNumber numberWithInt:[loc.timestamp timeIntervalSince1970]], [NSNumber numberWithDouble:loc.coordinate.latitude], [NSNumber numberWithDouble:loc.coordinate.longitude]];
+                _currentTripHasNewData = YES;
+            }
+        }
+
+        self.lastLocation = loc;
+        self.lastLocationDictionary = [self currentDictionaryFromLocation:self.lastLocation];
+
+    }
+
+    if(didAddData) {
+        [[NSNotificationCenter defaultCenter] postNotificationName:GLNewDataNotification object:self
+                                                          userInfo:@{GLNewDataLocationsKey: addedLocations, GLNewDataQueueKeysKey: addedKeys}];
+
+        if(self.tripInProgress && self.liveActivityEnabled) {
+            [self updateTripLiveActivityForcingUpdate:NO];
+        }
+    }
+
+    // Auto-stop uses the phone's real location, not a wifi zone's. It only stops continuous
+    // updates, so it doesn't apply when tracking only significant location changes.
+    BOOL continuousUpdates = self.tripInProgress || self.trackingMode == kGLTrackingModeStandard || self.trackingMode == kGLTrackingModeStandardAndSignificant;
+    if(self.lastDeviceLocation) {
+        if([GLAutoStop shared].stopped) {
+            if([[GLAutoStop shared] shouldResumeAt:self.lastDeviceLocation]) {
+                [self resumeFromAutoStop];
+            }
+        } else if(continuousUpdates && [[GLAutoStop shared] shouldStopAfter:self.lastDeviceLocation]) {
+            [self stopUpdatesAutomatically];
+        }
+    }
+
+    [self sendQueueIfTimeElapsed];
+    
+    [self scheduleLocalNotification];
+}
+
+- (void)addMetadataToUpdate:(NSDictionary *) update {
+    NSMutableDictionary *properties = [update objectForKey:@"properties"];
+    if(_deviceId && _deviceId.length > 0) {
+        [properties setValue:_deviceId forKey:@"device_id"];
+    }
+    [properties setValue:[GLManager currentWifiHotSpotName] forKey:@"wifi"];
+    [properties setValue:[GLManager currentWifiBSSID] forKey:@"wifi_bssid"];
+    [properties setValue:[self currentBatteryState] forKey:@"battery_state"];
+    [properties setValue:[self currentBatteryLevel] forKey:@"battery_level"];
+    if([[NSUserDefaults standardUserDefaults] boolForKey:GLIncludeUniqueIdDefaultsName]) {
+        NSString *uniqueId = [UIDevice currentDevice].identifierForVendor.UUIDString;
+        [properties setValue:uniqueId forKey:@"unique_id"];
+    }
+}
+
+- (NSDictionary *)currentDictionaryFromLocation:(CLLocation *)loc {
+    NSString *timestamp = [GLManager iso8601DateStringFromDate:loc.timestamp];
+    NSDictionary *update = @{
+             @"type": @"Feature",
+             @"geometry": @{
+                     @"type": @"Point",
+                     @"coordinates": @[
+                             [NSNumber numberWithDouble:((int)(loc.coordinate.longitude * 10000000)) / 10000000.0],
+                             [NSNumber numberWithDouble:((int)(loc.coordinate.latitude * 10000000)) / 10000000.0]
+                             ]
+                     },
+             @"properties": [NSMutableDictionary dictionaryWithDictionary:@{
+                     @"timestamp": timestamp,
+                     @"altitude": [NSNumber numberWithInt:(int)round(loc.altitude)],
+                     @"speed": [NSNumber numberWithDouble:((int)(loc.speed * 100)) / 100.0],
+                     @"course": [NSNumber numberWithInt:(int)round(loc.course)],
+                     @"horizontal_accuracy": [NSNumber numberWithInt:(int)round(loc.horizontalAccuracy)],
+                     @"vertical_accuracy": [NSNumber numberWithInt:(int)round(loc.verticalAccuracy)],
+                     @"speed_accuracy": [NSNumber numberWithDouble:((int)(loc.speedAccuracy * 100)) / 100.0],
+                     @"course_accuracy": [NSNumber numberWithDouble:((int)(loc.courseAccuracy * 100)) / 100.0],
+                     @"motion": [self motionArrayFromLastMotion],
+                     }]
+             };
+    [self addMetadataToUpdate:update];
+    // Barometric pressure and altitude, when there's a reading from around the time of this point
+    [update[@"properties"] addEntriesFromDictionary:[[GLBarometer shared] propertiesForDate:loc.timestamp]];
+    return update;
+}
+
+- (NSDictionary *)owntracksDictionaryFromLocation:(CLLocation *)loc {
+    NSMutableDictionary *update = [NSMutableDictionary dictionaryWithDictionary:@{
+        @"_type": @"location",
+        @"lat": [NSNumber numberWithDouble:((int)(loc.coordinate.latitude * 10000000)) / 10000000.0],
+        @"lon": [NSNumber numberWithDouble:((int)(loc.coordinate.longitude * 10000000)) / 10000000.0],
+        @"tst": [NSNumber numberWithDouble:loc.timestamp.timeIntervalSince1970],
+        @"acc": [NSNumber numberWithInt:(int)round(loc.horizontalAccuracy)],
+        @"batt": [NSNumber numberWithInt:[[self currentBatteryLevel] doubleValue] * 100],
+    }];
+    [update setValue:[[GLBarometer shared] pressureForDate:loc.timestamp] forKey:@"p"];
+    if(_deviceId && _deviceId.length > 0) {
+        NSString *topic = [NSString stringWithFormat:@"owntracks/%@", _deviceId];
+        [update setValue:topic forKey:@"topic"];
+    }
+    return update;
+}
+
+// Moving when walking, running, cycling or driving is reported with at least medium confidence.
+// Without motion data this is always NO.
+- (BOOL)deviceIsMoving {
+    CMMotionActivity *motion = self.lastMotion;
+    return (motion.walking || motion.running || motion.cycling || motion.automotive)
+        && motion.confidence != CMMotionActivityConfidenceLow;
+}
+
+// Stationary only counts when no movement is reported as well, since a phone resting on a car's
+// dashboard often reports both driving and stationary. Without motion data this is always NO.
+// Low confidence counts too: after arriving somewhere, stationary readings are often low confidence
+// for many minutes, and a stop started by mistake ends as soon as real movement is reported.
+- (BOOL)deviceIsStationary {
+    CMMotionActivity *motion = self.lastMotion;
+    return motion.stationary && !motion.walking && !motion.running && !motion.cycling && !motion.automotive;
+}
+
+- (NSArray *)motionArrayFromLastMotion {
+    NSMutableArray *motion = [[NSMutableArray alloc] init];
+    CMMotionActivity *motionActivity = [GLManager sharedManager].lastMotion;
+    if(motionActivity.walking)
+        [motion addObject:@"walking"];
+    if(motionActivity.running)
+        [motion addObject:@"running"];
+    if(motionActivity.cycling)
+        [motion addObject:@"cycling"];
+    if(motionActivity.automotive)
+        [motion addObject:@"driving"];
+    if(motionActivity.stationary)
+        [motion addObject:@"stationary"];
+    return [NSArray arrayWithArray:motion];
+}
+
+- (void)locationManagerDidPauseLocationUpdates:(CLLocationManager *)manager {
+    [self logAction:@"paused_location_updates"];
+    
+    // With auto-stop on, stopping and starting is expected, so don't notify about it
+    if(![GLAutoStop shared].active) {
+        [self notify:@"Location updates paused" withTitle:@"Paused"];
+    }
+    
+    [self finishPausingUpdates];
+}
+
+// Auto-stop: the phone has stayed within the auto-stop radius long enough. Stop updates the way iOS
+// pauses them, but keep significant location changes running as a way to start again, in case
+// Resume with Geofence is off.
+- (void)stopUpdatesAutomatically {
+    [self.locationManager stopUpdatingLocation];
+    [self.locationManager stopUpdatingHeading];
+    [self.locationManager startMonitoringSignificantLocationChanges];
+    [[GLAutoStop shared] markStoppedAt:self.lastDeviceLocation];
+
+    [self logAction:@"auto_stopped_location_updates"];
+
+    // The reminder that tracking has stopped would fire, since no more updates arrive to cancel it
+    [self cancelLocalNotification];
+
+    [self finishPausingUpdates];
+}
+
+// A location from outside the auto-stop radius arrived, from a significant location change
+- (void)resumeFromAutoStop {
+    for(CLRegion *region in self.locationManager.monitoredRegions) {
+        if([region.identifier isEqualToString:@"resume-from-pause"]) {
+            [self.locationManager stopMonitoringForRegion:region];
+        }
+    }
+
+    [self logAction:@"auto_resumed_location_updates"];
+
+    // Restarts updates with the current settings, and resets auto-stop
+    [self enableTracking];
+}
+
+// The part of pausing that's the same whether iOS paused updates or auto-stop stopped them
+- (void)finishPausingUpdates {
+    // Create an exit geofence to help it resume automatically
+    if(self.resumesAfterDistance > 0) {
+        CLCircularRegion *region = [[CLCircularRegion alloc] initWithCenter:self.lastLocation.coordinate radius:self.resumesAfterDistance identifier:@"resume-from-pause"];
+        region.notifyOnEntry = NO;
+        region.notifyOnExit = YES;
+        [self.locationManager startMonitoringForRegion:region];
+    }
+    
+    // Send the queue now to flush all remaining points
+    [self sendQueueIfNotInProgress];
+    
+    // If a trip was in progress, stop it now
+    if(self.tripInProgress) {
+        [self endTripFromAutopause:YES];
+    }
+}
+
+-(void)locationManager:(CLLocationManager *)manager didExitRegion:(CLRegion *)region {
+    NSLog(@"Did exit region");
+    [self logAction:@"exited_pause_region"];
+    if(![GLAutoStop shared].active) {
+        [self notify:@"Starting updates from exiting the geofence" withTitle:@"Resumed"];
+    }
+    [self.locationManager stopMonitoringForRegion:region];
+    [self enableTracking];
+}
+
+- (void)locationManagerDidResumeLocationUpdates:(CLLocationManager *)manager {
+    [self logAction:@"resumed_location_updates"];
+    if(![GLAutoStop shared].active) {
+        [self notify:@"Location updates resumed" withTitle:@"Resumed"];
+    }
+}
+
+#pragma mark - AppDelegate Methods
+
+- (void)applicationDidEnterBackground {
+    // [self logAction:@"did_enter_background"];
+}
+
+- (void)applicationWillTerminate {
+    [self logAction:@"will_terminate"];
+}
+
+- (void)applicationWillResignActive {
+    // [self logAction:@"will_resign_active"];
+}
+
+#pragma mark - Notifications
+
+- (BOOL)notificationsEnabled {
+    if([self defaultsKeyExists:GLNotificationsEnabledDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] boolForKey:GLNotificationsEnabledDefaultsName];
+    } else {
+        return NO;
+    }
+}
+- (void)setNotificationsEnabled:(BOOL)enabled {
+    if(enabled) {
+        [self requestNotificationPermission];
+    } else {
+        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:GLNotificationsEnabledDefaultsName];
+        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:GLNotificationPermissionRequestedDefaultsName];
+    }
+}
+
+#pragma mark - Live Activity
+
+- (BOOL)liveActivityEnabled {
+    if([self defaultsKeyExists:GLLiveActivityEnabledDefaultsName]) {
+        return [[NSUserDefaults standardUserDefaults] boolForKey:GLLiveActivityEnabledDefaultsName];
+    } else {
+        return YES;
+    }
+}
+- (void)setLiveActivityEnabled:(BOOL)enabled {
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:GLLiveActivityEnabledDefaultsName];
+    if(!self.tripInProgress) {
+        return;
+    }
+    if(enabled) {
+        [self startTripLiveActivity];
+    } else {
+        [self endTripLiveActivity];
+    }
+}
+
+- (double)currentSpeedForLiveActivity {
+    return self.lastLocation ? MAX(self.lastLocation.speed, 0) : 0;
+}
+
+- (void)startTripLiveActivity {
+    [[TripLiveActivityController shared] startTripAt:self.currentTripStart
+                                                 mode:self.currentTripMode
+                                             distance:self.currentTripDistance
+                                                speed:[self currentSpeedForLiveActivity]];
+}
+
+- (void)updateTripLiveActivityForcingUpdate:(BOOL)force {
+    [[TripLiveActivityController shared] updateWithMode:self.currentTripMode
+                                               distance:self.currentTripDistance
+                                                  speed:[self currentSpeedForLiveActivity]
+                                                  force:force];
+}
+
+// Called before the trip state is cleared, so the final distance is still available
+- (void)endTripLiveActivity {
+    [[TripLiveActivityController shared] endTripWithMode:self.currentTripMode
+                                                distance:self.currentTripDistance
+                                                   speed:0];
+}
+
+// On launch, reattach to the activity for a trip in progress, or clean up a stale one
+- (void)syncTripLiveActivity {
+    BOOL showActivity = self.tripInProgress && self.liveActivityEnabled;
+    [[TripLiveActivityController shared] syncWithTripStart:(showActivity ? self.currentTripStart : nil)
+                                                      mode:self.currentTripMode
+                                                  distance:(showActivity ? self.currentTripDistance : 0)
+                                                     speed:[self currentSpeedForLiveActivity]];
+}
+
+- (void)initializeNotifications {
+    UNUserNotificationCenter *notificationCenter = [UNUserNotificationCenter currentNotificationCenter];
+    notificationCenter.delegate = self;
+    
+    // If notifications were successfully requested previously, initialize again for this app launch
+    if([[NSUserDefaults standardUserDefaults] boolForKey:GLNotificationPermissionRequestedDefaultsName]) {
+        [self requestNotificationPermission];
+    }
+    
+    UNNotificationAction *endTripAction = [UNNotificationAction actionWithIdentifier:@"END_TRIP" title:@"End Trip" options:UNNotificationActionOptionNone];
+    UNNotificationCategory *actionCategory = [UNNotificationCategory categoryWithIdentifier:GLNotificationCategoryTripName
+                                                                                    actions:@[endTripAction]
+                                                                          intentIdentifiers:@[]
+                                                                                    options:UNNotificationCategoryOptionNone];
+    [notificationCenter setNotificationCategories:[NSSet setWithArray:@[actionCategory]]];
+}
+
+- (void)requestNotificationPermission {
+    UNUserNotificationCenter *notificationCenter = [UNUserNotificationCenter currentNotificationCenter];
+
+    UNAuthorizationOptions options = UNAuthorizationOptionAlert + UNAuthorizationOptionSound;
+    [notificationCenter requestAuthorizationWithOptions:options
+                                      completionHandler:^(BOOL granted, NSError * _Nullable error) {
+                                          // If the user denies permission, set requested=NO so that if they ever enable it in settings again the permission will be requested again
+                                          [[NSUserDefaults standardUserDefaults] setBool:granted forKey:GLNotificationPermissionRequestedDefaultsName];
+                                          [[NSUserDefaults standardUserDefaults] setBool:granted forKey:GLNotificationsEnabledDefaultsName];
+                                          if(!granted) {
+                                              NSLog(@"User did not allow notifications");
+                                          }
+                                      }];
+}
+
+- (void)notify:(NSString *)message withTitle:(NSString *)title
+{
+    if([self notificationsEnabled]) {
+        UNUserNotificationCenter *notificationCenter = [UNUserNotificationCenter currentNotificationCenter];
+        
+        UNMutableNotificationContent *content = [UNMutableNotificationContent new];
+        content.title = title;
+        content.body = message;
+        content.sound = [UNNotificationSound defaultSound];
+        
+        /* UNTimeIntervalNotificationTrigger *trigger = [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:1 repeats:NO]; */
+        
+        NSString *identifier = @"GLLocalNotification";
+        UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:identifier
+                                                                              content:content
+                                                                              trigger:nil];
+        
+        [notificationCenter addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
+            if (error != nil) {
+                NSLog(@"Something went wrong: %@",error);
+            } else {
+                NSLog(@"Notification sent");
+            }
+        }];
+    }
+}
+
+/* Force notifications to display as normal when the app is active */
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+       willPresentNotification:(UNNotification *)notification
+         withCompletionHandler:(void (^)(UNNotificationPresentationOptions options))completionHandler {
+    
+    completionHandler(UNNotificationPresentationOptionList | UNNotificationPresentationOptionBanner);
+}
+
+- (void)askToEndTrip
+{
+    if(self.notificationsEnabled) {
+        UNUserNotificationCenter *notificationCenter = [UNUserNotificationCenter currentNotificationCenter];
+
+        UNMutableNotificationContent *content = [UNMutableNotificationContent new];
+        content.title = @"End Trip";
+        content.body = @"It looks like you stopped moving, would you like to end the current trip?";
+        content.sound = [UNNotificationSound defaultSound];
+        content.categoryIdentifier = GLNotificationCategoryTripName;
+        
+        NSString *identifier = @"GLLocalNotificationEndTripPrompt";
+        UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:identifier
+                                                                              content:content
+                                                                              trigger:nil];
+
+        [notificationCenter addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
+            if(error != nil) {
+                NSLog(@"Something went wrong trying to ask to end the trip: %@", error);
+            } else{
+                NSLog(@"Notification sent");
+            }
+        }];
+    }
+}
+
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center didReceiveNotificationResponse:(nonnull UNNotificationResponse *)response withCompletionHandler:(nonnull void (^)(void))completionHandler
+{
+    if([@"END_TRIP" isEqualToString:response.actionIdentifier]) {
+        // A prompt sent after the phone stopped ends the trip when it stopped, as long as it's
+        // still the same trip. Times are seconds since 1970.
+        NSDictionary *info = response.notification.request.content.userInfo;
+        NSNumber *tripStart = info[GLEndTripPromptTripStartKey];
+        NSNumber *stoppedAt = info[GLEndTripPromptStoppedAtKey];
+        if(self.tripInProgress && tripStart && stoppedAt
+           && fabs([self.currentTripStart timeIntervalSince1970] - [tripStart doubleValue]) < 1
+           && [stoppedAt doubleValue] > [tripStart doubleValue]) {
+            NSDate *stopDate = [NSDate dateWithTimeIntervalSince1970:[stoppedAt doubleValue]];
+            CLLocation *stopLocation = nil;
+            if(info[GLEndTripPromptLatitudeKey] && info[GLEndTripPromptLongitudeKey]) {
+                stopLocation = [[CLLocation alloc] initWithCoordinate:CLLocationCoordinate2DMake([info[GLEndTripPromptLatitudeKey] doubleValue], [info[GLEndTripPromptLongitudeKey] doubleValue])
+                                                             altitude:0
+                                                   horizontalAccuracy:[info[GLEndTripPromptAccuracyKey] doubleValue]
+                                                     verticalAccuracy:-1
+                                                            timestamp:stopDate];
+            }
+            [self endTripAtDate:stopDate location:stopLocation];
+        } else {
+            [self endTrip];
+        }
+
+        // If location updates were off when the trip was started, disable location now
+        if([[NSUserDefaults standardUserDefaults] boolForKey:GLTripTrackingEnabledDefaultsName] == NO) {
+            [[GLManager sharedManager] stopAllUpdates];
+        }
+    }
+    
+    completionHandler();
+}
+
+
+#pragma mark - Wifi Positioning
+
+/*
+ Allow the user to configure wifi names mapping to locations. If the phone is connected to
+ one of the known wifi names, use the configured location instead of the phone's reported location.
+ This should help avoid GPS drift around common locations like "home" and "work", and can
+ also be used to pause location updates when the user gets home.
+*/
+
+- (CLLocation *)currentLocationFromWifiName:(NSString *)wifi bssid:(NSString *)bssid {
+    if(wifi == nil) {
+        return nil;
+    }
+
+    // A zone limited to the current access point takes priority over a zone for the whole network
+    NSDictionary *matchingZone = nil;
+    if(bssid.length > 0) {
+        for(NSDictionary *zone in self.wifiZones) {
+            if([zone[@"name"] isEqualToString:wifi] && [[GLManager normalizedBSSID:zone[@"bssid"]] isEqualToString:bssid]) {
+                matchingZone = zone;
+                break;
+            }
+        }
+    }
+    if(matchingZone == nil) {
+        for(NSDictionary *zone in self.wifiZones) {
+            if([zone[@"name"] isEqualToString:wifi] && [zone[@"bssid"] length] == 0) {
+                matchingZone = zone;
+                break;
+            }
+        }
+    }
+
+    if(matchingZone == nil) {
+        return nil;
+    }
+
+    double latitude = [matchingZone[@"latitude"] doubleValue];
+    double longitude = [matchingZone[@"longitude"] doubleValue];
+    CLLocationCoordinate2D coord = CLLocationCoordinate2DMake(latitude, longitude);
+    NSDate *timestamp = NSDate.date;
+
+    CLLocation *loc = [[CLLocation alloc] initWithCoordinate:coord
+                                                    altitude:-1
+                                          horizontalAccuracy:1
+                                            verticalAccuracy:0
+                                                      course:0
+                                                       speed:0
+                                                   timestamp:timestamp];
+    return loc;
+}
+
+- (NSArray *)wifiZones {
+    NSArray *zones = [[NSUserDefaults standardUserDefaults] arrayForKey:GLWifiZonesDefaultsName];
+    if(zones) {
+        return zones;
+    }
+
+    // Earlier versions stored a single wifi zone in separate keys. Move it into the list.
+    NSString *name = [[NSUserDefaults standardUserDefaults] stringForKey:@"WifiZoneName"];
+    if(name.length > 0) {
+        zones = @[@{
+            @"name": name,
+            @"latitude": [[NSUserDefaults standardUserDefaults] stringForKey:@"WifiZoneLatitude"] ?: @"",
+            @"longitude": [[NSUserDefaults standardUserDefaults] stringForKey:@"WifiZoneLongitude"] ?: @"",
+        }];
+    } else {
+        zones = @[];
+    }
+    [self saveWifiZones:zones];
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"WifiZoneName"];
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"WifiZoneLatitude"];
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"WifiZoneLongitude"];
+    return zones;
+}
+
+- (void)saveWifiZones:(NSArray *)zones {
+    [[NSUserDefaults standardUserDefaults] setObject:zones forKey:GLWifiZonesDefaultsName];
+}
+
+
+#pragma mark -
+
+- (BOOL)defaultsKeyExists:(NSString *)key {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    return [[[defaults dictionaryRepresentation] allKeys] containsObject:key];
+}
+
+// The name of the current wifi network as of the last refresh, or an empty string if not connected
++ (NSString *)currentWifiHotSpotName {
+    return _currentWifiHotSpotName;
+}
+
+// The address of the current wifi access point as of the last refresh, normalized by
+// normalizedBSSID:, or an empty string if not connected
++ (NSString *)currentWifiBSSID {
+    return _currentWifiBSSID;
+}
+
+// A BSSID as lowercase, colon-separated, two-digit hex octets, or nil if it isn't six octets.
+// iOS can drop leading zeros, e.g. "3c:22:fb:1a:0:11"
++ (NSString *)normalizedBSSID:(NSString *)bssid {
+    NSArray *octets = [[bssid stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]] componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@":-"]];
+    if(octets.count != 6) {
+        return nil;
+    }
+    NSCharacterSet *nonHex = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF"] invertedSet];
+    NSMutableArray *normalized = [NSMutableArray arrayWithCapacity:6];
+    for(NSString *octet in octets) {
+        if(octet.length < 1 || octet.length > 2 || [octet rangeOfCharacterFromSet:nonHex].location != NSNotFound) {
+            return nil;
+        }
+        [normalized addObject:[(octet.length == 1 ? [@"0" stringByAppendingString:octet] : octet) lowercaseString]];
+    }
+    return [normalized componentsJoinedByString:@":"];
+}
+
+// CNCopyCurrentNetworkInfo always returns NULL for apps built with the iOS 26 SDK, so this uses
+// NEHotspotNetwork, which only returns the network when the app has precise location access
++ (void)refreshCurrentWifiHotSpotName:(void(^)(NSString *wifiName))completion {
+    [NEHotspotNetwork fetchCurrentWithCompletionHandler:^(NEHotspotNetwork * _Nullable currentNetwork) {
+        _currentWifiHotSpotName = currentNetwork.SSID ?: @"";
+        _currentWifiBSSID = [GLManager normalizedBSSID:currentNetwork.BSSID] ?: @"";
+        if(completion) {
+            completion(_currentWifiHotSpotName);
+        }
+    }];
+}
+
+#pragma mark - FMDB
+
++ (NSString *)tripDatabasePath {
+    NSString *docsPath = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
+    return [docsPath stringByAppendingPathComponent:@"trips.sqlite"];
+}
+
+- (void)setUpTripDB {
+    [self.tripdb open];
+    if(![self.tripdb executeUpdate:@"CREATE TABLE IF NOT EXISTS trips (\
+       id INTEGER PRIMARY KEY AUTOINCREMENT, \
+       timestamp INTEGER, \
+       latitude REAL, \
+       longitude REAL \
+     )"]) {
+        NSLog(@"Error creating trip DB: %@", self.tripdb.lastErrorMessage);
+    }
+    [self.tripdb close];
+}
+
+- (void)clearTripDB {
+    [self.tripdb executeUpdate:@"DELETE FROM trips"];
+}
+
+
+#pragma mark - LOLDB
+
++ (NSString *)cacheDatabasePath
+{
+    NSString *caches = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) objectAtIndex:0];
+    return [caches stringByAppendingPathComponent:@"GLLoggerCache.sqlite"];
+}
+
++ (id)objectFromJSONData:(NSData *)data error:(NSError **)error;
+{
+    return [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingAllowFragments error:error];
+}
+
++ (NSData *)dataWithJSONObject:(id)object error:(NSError **)error;
+{
+    return [NSJSONSerialization dataWithJSONObject:[self JSONSafeObject:object] options:0 error:error];
+}
+
+// JSON can't represent NaN or infinity, and NSJSONSerialization throws an exception for them,
+// which would crash the app while it's writing to the queue. Replace them with null instead.
++ (id)JSONSafeObject:(id)object {
+    if([object isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *safe = [NSMutableDictionary dictionaryWithCapacity:[object count]];
+        [(NSDictionary *)object enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
+            safe[key] = [self JSONSafeObject:value];
+        }];
+        return safe;
+    } else if([object isKindOfClass:[NSArray class]]) {
+        NSMutableArray *safe = [NSMutableArray arrayWithCapacity:[object count]];
+        for(id value in (NSArray *)object) {
+            [safe addObject:[self JSONSafeObject:value]];
+        }
+        return safe;
+    } else if([object isKindOfClass:[NSNumber class]]) {
+        double value = [object doubleValue];
+        if(isnan(value) || isinf(value)) {
+            return [NSNull null];
+        }
+    }
+    return object;
+}
+
++ (NSString *)iso8601DateStringFromDate:(NSDate *)date {
+    struct tm *timeinfo;
+    char buffer[80];
+    
+    time_t rawtime = (time_t)[date timeIntervalSince1970];
+    timeinfo = gmtime(&rawtime);
+    
+    strftime(buffer, 80, "%Y-%m-%dT%H:%M:%SZ", timeinfo);
+    
+    return [NSString stringWithCString:buffer encoding:NSUTF8StringEncoding];
+}
+
+@end

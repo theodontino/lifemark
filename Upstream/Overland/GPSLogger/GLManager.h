@@ -1,0 +1,251 @@
+//
+//  GLManager.h
+//  GPSLogger
+//
+//  Created by Aaron Parecki on 9/17/15.
+//  Copyright © 2015 Esri. All rights reserved.
+//
+
+#import <Foundation/Foundation.h>
+#import <CoreLocation/CoreLocation.h>
+#import <CoreMotion/CoreMotion.h>
+#import "GLCloudFileWriter.h"
+@import UserNotifications;
+
+static NSString *const GLNewDataNotification = @"GLNewDataNotification";
+static NSString *const GLNewActivityNotification = @"GLNewActivityNotification";
+static NSString *const GLAuthorizationStatusChangedNotification = @"GLAuthorizationStatusChangedNotification";
+static NSString *const GLSendingStartedNotification = @"GLSendingStartedNotification";
+static NSString *const GLSendingFinishedNotification = @"GLSendingFinishedNotification";
+static NSString *const GLSettingsChangedNotification = @"GLSettingsChangedNotification";
+
+// In GLNewDataNotification's userInfo when it's posted for new points: the locations that were
+// added to the queue, in order, and their queue keys
+static NSString *const GLNewDataLocationsKey = @"locations";
+static NSString *const GLNewDataQueueKeysKey = @"queue_keys";
+// In GLSendingFinishedNotification's userInfo after a batch was sent: the queue keys removed
+static NSString *const GLSentQueueKeysKey = @"queue_keys";
+
+static NSString *const GLAPIEndpointDefaultsName = @"GLAPIEndpointDefaults";
+static NSString *const GLAPIAccessTokenDefaultsName = @"GLAPIAccessTokenDefaults";
+static NSString *const GLDeviceIdDefaultsName = @"GLDeviceIdDefaults";
+static NSString *const GLLastSentDateDefaultsName = @"GLLastSentDateDefaults";
+static NSString *const GLTrackingStateDefaultsName = @"GLTrackingStateDefaults";
+static NSString *const GLSendIntervalDefaultsName = @"GLSendIntervalDefaults";
+static NSString *const GLPausesAutomaticallyDefaultsName = @"GLPausesAutomaticallyDefaults";
+static NSString *const GLResumesAutomaticallyDefaultsName = @"GLResumesAutomaticallyDefaults";
+static NSString *const GLDiscardPointsWithinDistanceDefaultsName = @"GLDiscardPointsWithinDistanceDefaults";
+static NSString *const GLDiscardPointsWithinSecondsDefaultsName = @"GLDiscardPointsWithinSecondsDefaults";
+static NSString *const GLDiscardPointsWithoutGPSDefaultsName = @"GLDiscardPointsWithoutGPSDefaults";
+static NSString *const GLDiscardPointsWhileStationaryDefaultsName = @"GLDiscardPointsWhileStationaryDefaults";
+static NSString *const GLDiscardPointsWorseThanAccuracyDefaultsName = @"GLDiscardPointsWorseThanAccuracyDefaults";
+static NSString *const GLIncludeTrackingStatsDefaultsName = @"GLIncludeTrackingStatsDefaultsName";
+static NSString *const GLActivityTypeDefaultsName = @"GLActivityTypeDefaults";
+static NSString *const GLDesiredAccuracyDefaultsName = @"GLDesiredAccuracyDefaults";
+static NSString *const GLSignificantLocationModeDefaultsName = @"GLSignificantLocationModeDefaults";
+static NSString *const GLPointsPerBatchDefaultsName = @"GLPointsPerBatchDefaults";
+static NSString *const GLNotificationPermissionRequestedDefaultsName = @"GLNotificationPermissionRequestedDefaults";
+static NSString *const GLNotificationsEnabledDefaultsName = @"GLNotificationsEnabledDefaults";
+static NSString *const GLIncludeUniqueIdDefaultsName = @"GLIncludeUniqueIdDefaults";
+static NSString *const GLConsiderHTTP200SuccessDefaultsName = @"GLConsiderHTTP200SuccessDefaults";
+static NSString *const GLBackgroundIndicatorDefaultsName = @"GLBackgroundIndicatorDefaults";
+static NSString *const GLLoggingModeDefaultsName = @"GLLoggingModeDefaults";
+static NSString *const GLTripModeStatsDefaultsName = @"GLTripModeStats";
+static NSString *const GLVisitTrackingEnabledDefaultsName = @"GLVisitTrackingEnabledDefaults";
+static NSString *const GLCustomHeadersDefaultsName = @"GLCustomHeadersDefaults";
+static NSString *const GLWifiZonesDefaultsName = @"GLWifiZonesDefaults";
+static NSString *const GLScreenScaleDefaultsName = @"GLScreenScaleDefaults";
+// "server" (the default) or "icloud"
+static NSString *const GLDestinationDefaultsName = @"GLDestinationDefaults";
+// "daily" (the default) or "trips"
+static NSString *const GLCloudFileModeDefaultsName = @"GLCloudFileModeDefaults";
+
+static NSString *const GLPurgeQueueOnNextLaunchDefaultsName = @"GLPurgeQueueOnNextLaunch";
+static NSString *const GLLastScheduledNotificationDateDefaultsName = @"GLLastScheduledNotificationDateDefaults";
+
+/* During-Trip Defaults */
+static NSString *const GLTripDesiredAccuracyDefaultsName = @"GLTripDesiredAccuracyDefaults";
+static NSString *const GLTripActivityTypeDefaultsName = @"GLTripActivityTypeDefaults";
+static NSString *const GLTripBackgroundIndicatorDefaultsName = @"GLTripBackgroundIndicatorDefaults";
+static NSString *const GLTripPausesAutomaticallyDefaultsName = @"GLTripPausesAutomaticallyDefaults";
+static NSString *const GLTripLoggingModeDefaultsName = @"GLTripLoggingModeDefaults";
+static NSString *const GLTripPointsPerBatchDefaultsName = @"GLTripPointsPerBatchDefaults";
+static NSString *const GLTripDiscardPointsWithinDistanceDefaultsName = @"GLTripDiscardPointsWithinDistanceDefaults";
+static NSString *const GLTripDiscardPointsWithinSecondsDefaultsName = @"GLTripDiscardPointsWithinSecondsDefaults";
+static NSString *const GLTripDiscardPointsWithoutGPSDefaultsName = @"GLTripDiscardPointsWithoutGPSDefaults";
+static NSString *const GLTripDiscardPointsWhileStationaryDefaultsName = @"GLTripDiscardPointsWhileStationaryDefaults";
+static NSString *const GLTripDiscardPointsWorseThanAccuracyDefaultsName = @"GLTripDiscardPointsWorseThanAccuracyDefaults";
+static NSString *const GLScreenLockEnabledDefaultsName = @"GLScreenLockEnabledDefaults";
+static NSString *const GLLiveActivityEnabledDefaultsName = @"GLLiveActivityEnabledDefaults";
+/* End */
+
+static NSString *const GLTripTrackingEnabledDefaultsName = @"GLTripTrackingEnabledDefaults";
+// Trip Settings: ask to end the trip after stopping (TripEndPrompt.swift)
+static NSString *const GLTripAskToEndWhenStoppedDefaultsName = @"GLTripAskToEndWhenStoppedDefaults";
+static NSString *const GLLastTripEndDefaultsName = @"GLLastTripEndDefaults";
+
+// The notification category with the End Trip action, and the userInfo of a prompt that ends the
+// trip at the time the phone stopped rather than when the action is tapped
+static NSString *const GLNotificationCategoryTripName = @"TRIP";
+static NSString *const GLEndTripPromptTripStartKey = @"trip_start";
+static NSString *const GLEndTripPromptStoppedAtKey = @"stopped_at";
+static NSString *const GLEndTripPromptLatitudeKey = @"latitude";
+static NSString *const GLEndTripPromptLongitudeKey = @"longitude";
+static NSString *const GLEndTripPromptAccuracyKey = @"horizontal_accuracy";
+static NSString *const GLTripModeDefaultsName = @"GLTripModeDefaults";
+static NSString *const GLTripStartTimeDefaultsName = @"GLTripStartTimeDefaults";
+static NSString *const GLTripStartLocationDefaultsName = @"GLTripStartLocationDefaults";
+
+typedef enum {
+    kGLTrackingModeOff,
+    kGLTrackingModeStandard,
+    kGLTrackingModeSignificant,
+    kGLTrackingModeStandardAndSignificant
+} GLTrackingMode;
+
+typedef enum {
+    kGLLoggingModeAllData,
+    kGLLoggingModeOnlyLatest,
+    kGLLoggingModeOwntracks
+} GLLoggingMode;
+
+typedef enum {
+    kGLLocationPropertyTimestamp,
+    kGLLocationPropertyLatitude,
+    kGLLocationPropertyLongitude,
+    kGLLocationPropertyAccuracy,
+    kGLLocationPropertySpeed,
+    kGLLocationPropertyAltitude,
+    kGLLocationPropertyBattery
+} GLLocationProperty;
+
+typedef void (^CaseBlock)(void);
+
+@interface GLManager : NSObject <CLLocationManagerDelegate, UNUserNotificationCenterDelegate>
+
++ (GLManager *)sharedManager;
+
++ (NSString *)currentWifiHotSpotName;
++ (void)refreshCurrentWifiHotSpotName:(void(^)(NSString *wifiName))completion;
++ (NSString *)currentWifiBSSID;
++ (NSString *)normalizedBSSID:(NSString *)bssid;
+
+@property (strong, nonatomic, readonly) CLLocationManager *locationManager;
+@property (strong, nonatomic, readonly) CMMotionActivityManager *motionActivityManager;
+
+@property (strong, nonatomic) NSNumber *sendingInterval;
+@property BOOL pausesAutomatically;
+@property BOOL includeTrackingStats;
+@property BOOL notificationsEnabled;
+@property (nonatomic) BOOL liveActivityEnabled;
+@property (nonatomic) CLLocationDistance resumesAfterDistance;
+@property (nonatomic) CLLocationDistance discardPointsWithinDistance;
+@property (nonatomic) int discardPointsWithinSeconds;
+@property (nonatomic) BOOL discardPointsWithoutGPS;
+@property (nonatomic) BOOL discardPointsWhileStationary;
+// Meters, or -1 for off
+@property (nonatomic) CLLocationAccuracy discardPointsWorseThanAccuracy;
+@property (nonatomic) GLTrackingMode trackingMode;
+@property BOOL visitTrackingEnabled;
+@property (nonatomic) GLLoggingMode loggingMode;
+@property (nonatomic) BOOL showBackgroundLocationIndicator;
+@property (nonatomic) CLActivityType activityType;
+@property (nonatomic) CLLocationAccuracy desiredAccuracy;
+@property (nonatomic) int pointsPerBatch;
+
+/* During-Trip Settings */
+@property (nonatomic) CLLocationAccuracy desiredAccuracyDuringTrip;
+@property (nonatomic) CLActivityType activityTypeDuringTrip;
+@property (nonatomic) BOOL showBackgroundLocationIndicatorDuringTrip;
+@property BOOL pausesAutomaticallyDuringTrip;
+@property (nonatomic) GLLoggingMode loggingModeDuringTrip;
+@property (nonatomic) int pointsPerBatchDuringTrip;
+@property (nonatomic) CLLocationDistance discardPointsWithinDistanceDuringTrip;
+@property (nonatomic) int discardPointsWithinSecondsDuringTrip;
+@property (nonatomic) BOOL discardPointsWithoutGPSDuringTrip;
+@property (nonatomic) BOOL discardPointsWhileStationaryDuringTrip;
+@property (nonatomic) CLLocationAccuracy discardPointsWorseThanAccuracyDuringTrip;
+/* End */
+
+@property (readonly) BOOL trackingEnabled;
+@property (readonly) BOOL sendInProgress;
+@property (strong, nonatomic, readonly) CLLocation *lastLocation;
+// The last location reported by the device, before a wifi zone replaces it
+@property (strong, nonatomic, readonly) CLLocation *lastDeviceLocation;
+@property (strong, nonatomic, readonly) NSDictionary *lastLocationDictionary;
+@property (strong, nonatomic, readonly) CMMotionActivity *lastMotion;
+@property (strong, nonatomic, readonly) NSString *lastMotionString;
+@property (strong, nonatomic, readonly) NSNumber *lastStepCount;
+@property (strong, nonatomic, readonly) NSDate *lastSentDate;
+@property (strong, nonatomic, readonly) NSString *lastLocationName;
+
+- (void)startAllUpdates;
+- (void)stopAllUpdates;
+- (void)refreshLocation;
+- (void)deleteAllData;
+
+- (NSString *)authorizationStatusAsString;
+- (void)requestAuthorizationPermission;
+
+- (void)saveNewAPIEndpoint:(NSString *)endpoint andAccessToken:(NSString *)accessToken;
+- (NSString *)apiEndpointURL;
+
+// Save location data to files in iCloud Drive instead of sending it to the server
+@property (nonatomic) BOOL savesToICloudDrive;
+@property (nonatomic) GLCloudFileMode cloudFileMode;
+// YES when there's somewhere to send data: iCloud Drive, or a server URL
+- (BOOL)hasDestination;
+
+// Why the last attempt to send or save data failed, or nil if it succeeded
+@property (strong, nonatomic, readonly) NSString *lastSendErrorTitle;
+@property (strong, nonatomic, readonly) NSString *lastSendErrorMessage;
+- (NSString *)apiAccessToken;
+- (void)saveNewDeviceId:(NSString *)deviceId;
+- (NSString *)deviceId;
+
+- (NSArray *)customHeaders;
+- (void)saveCustomHeaders:(NSArray *)headers;
++ (BOOL)isBlockedCustomHeaderName:(NSString *)name;
+
+- (void)logAction:(NSString *)action;
+- (void)sendQueueNow;
+- (void)notify:(NSString *)message withTitle:(NSString *)title;
+- (void)askToEndTrip;
+
+- (void)numberOfLocationsInQueue:(void(^)(long num))callback;
+- (void)numberOfObjectsInQueue:(void(^)(long locations, long trips, long stats))callback;
+// The locations in the queue, without visits, trip records and tracking stats, with their queue
+// keys. Not in any particular order.
+- (void)queuedLocations:(void(^)(NSArray<NSString *> *keys, NSArray<CLLocation *> *locations))callback;
+- (NSSet <__kindof CLRegion *>*)monitoredRegions;
+
+- (void)requestNotificationPermission;
+
+// Each wifi zone is a dictionary with "name", "latitude" and "longitude" strings, and an optional
+// "bssid" that limits the zone to one access point
+- (NSArray *)wifiZones;
+- (void)saveWifiZones:(NSArray *)zones;
+
+#pragma mark - Trips
+
+- (BOOL)tripInProgress;
+@property (nonatomic) NSString *currentTripMode;
+- (NSDate *)currentTripStart;
+- (CLLocationDistance)currentTripDistance;
+- (NSTimeInterval)currentTripDuration;
+- (void)startTrip;
+- (void)endTrip;
+// Ends the trip as if it had ended at endDate, at the given location: the trip record's end time,
+// duration, distance and steps stop there. nil for both means now, the same as endTrip.
+- (void)endTripAtDate:(NSDate * _Nullable)endDate location:(CLLocation * _Nullable)location;
+// When the last trip ended, which can be earlier than when it was ended
+@property (strong, nonatomic, readonly) NSDate * _Nullable lastTripEndDate;
+- (NSArray *)tripModesByFrequency;
+
+#pragma mark -
+
+- (void)applicationWillTerminate;
+- (void)applicationDidEnterBackground;
+- (void)applicationWillResignActive;
+
+@end

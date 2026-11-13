@@ -1,0 +1,5 @@
+{
+  "team_id": "YOUR_XCODE_TEAM_ID",
+  "phone_udid": "YOUR_IPHONE_UDID",
+  "watch_udid": "YOUR_APPLE_WATCH_UDID"
+}

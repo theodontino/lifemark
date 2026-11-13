@@ -1,0 +1,203 @@
+name: LifeRecord
+options:
+  bundleIdPrefix: local.liferecord
+  deploymentTarget:
+    macOS: "14.0"
+    iOS: "17.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGNING_ALLOWED: NO
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.1.0
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+packages:
+  LifeUI:
+    path: Packages/LifeUI
+  LifeStore:
+    path: Packages/LifeStore
+  LifeCore:
+    path: Packages/LifeCore
+  GRDB:
+    url: https://github.com/groue/GRDB.swift
+    from: 7.6.0
+  PostHog:
+    url: https://github.com/PostHog/posthog-ios
+    exactVersion: 3.31.0
+  MarkdownUI:
+    url: https://github.com/gonzalezreal/swift-markdown-ui
+    exactVersion: 2.4.1
+targets:
+  LifeRecordMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: Upstream/Dayflow/Dayflow/Dayflow
+        excludes: ["Info.plist", "Dayflow.entitlements", "**/*.md", "System/SilentUserDriver.swift"]
+      - path: App/Integration
+        excludes: ["OverlandLifeIntegration.swift", "README.md"]
+      - path: App/Mac
+      - path: App/Shared
+    info:
+      path: App/Mac/Info.plist
+      properties:
+        CFBundleDisplayName: 人生记录
+        LSApplicationCategoryType: public.app-category.productivity
+        NSScreenCaptureUsageDescription: 读取屏幕内容，帮助回顾实际做过的事情；你可以随时暂停。
+        NSAppleEventsUsageDescription: 在你选择时读取浏览器活动背景，用于回顾。
+        NSMicrophoneUsageDescription: 仅在你主动使用上游语音功能时访问麦克风。
+        LifeCloudContainerIdentifier: ""
+        SUEnableAutomaticChecks: false
+        SUAutomaticallyUpdate: false
+        SUAllowsAutomaticUpdates: false
+        ATSApplicationFontsPath: "."
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.liferecord.mac
+        PRODUCT_NAME: LifeRecord
+        PRODUCT_MODULE_NAME: Dayflow
+        ASSETCATALOG_COMPILER_APPICON_NAME: LifeMacIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        DAYFLOW_BACKEND_URL: ""
+        POSTHOG_API_KEY: ""
+    dependencies:
+      - package: LifeUI
+      - package: LifeStore
+      - package: LifeCore
+      - package: GRDB
+      - package: PostHog
+      - package: MarkdownUI
+  LifeRecordiOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: Upstream/Overland/GPSLogger
+        excludes: ["Info.plist", "PrivacyInfo.xcprivacy"]
+      - path: Upstream/Overland/Fonts
+        buildPhase: resources
+      - path: Upstream/FMDB/src/fmdb
+        excludes: ["**/Info.plist"]
+      - path: App/Integration
+        excludes: ["DayflowLifeIntegration.swift", "README.md"]
+      - path: App/TimerActivity/TimeActivityAttributes.swift
+      - path: App/TimerActivity/TimerActivityController.swift
+      - path: App/iOS
+      - path: App/Shared
+    info:
+      path: App/iOS/Info.plist
+      properties:
+        CFBundleDisplayName: 人生记录
+        NSSupportsLiveActivities: true
+        CFBundleURLTypes:
+          - CFBundleURLName: local.liferecord.timers
+            CFBundleURLSchemes: [liferecord]
+        UILaunchStoryboardName: LaunchScreen
+        UIMainStoryboardFile: Main
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: Default Configuration
+                UISceneDelegateClassName: SceneDelegate
+                UISceneStoryboardFile: Main
+        NSLocationWhenInUseUsageDescription: 你开启自动记录后，用位置辅助回顾实际去过哪里。
+        NSLocationAlwaysAndWhenInUseUsageDescription: 你开启后台记录后，记录地点停留，辅助回顾一天。
+        NSMotionUsageDescription: 你开启记录后，用运动状态辅助识别通勤线索。
+        NSPhotoLibraryUsageDescription: 选择付款截图，核对后记账。
+        NSLocalNetworkUsageDescription: 仅在主动使用原定位器网络功能时连接。
+        NSHealthShareUsageDescription: 仅在你主动使用原定位器健康功能时读取。
+        NSHealthUpdateUsageDescription: 仅在你主动使用原定位器健康功能时写入。
+        UIBackgroundModes: [location, remote-notification]
+        LifeCloudContainerIdentifier: ""
+        UIRequiredDeviceCapabilities: [arm64]
+        UIAppFonts: [OpenSans-Light.ttf, OpenSansCondensed-Bold.ttf, OpenSansCondensed-Light.ttf]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.liferecord.ios
+        PRODUCT_NAME: LifeRecord
+        PRODUCT_MODULE_NAME: Overland
+        ASSETCATALOG_COMPILER_APPICON_NAME: LifeiOSIcon
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) OVERLAND_APP"
+        SWIFT_OBJC_BRIDGING_HEADER: Upstream/Overland/GPSLogger/Overland-Bridging-Header.h
+        HEADER_SEARCH_PATHS: "$(inherited) $(SRCROOT)/Upstream/FMDB/src/fmdb $(SRCROOT)/Upstream/FMDB/include $(SRCROOT)/Upstream/Overland/GPSLogger"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CLANG_ENABLE_MODULES: YES
+    dependencies:
+      - target: LifeTimerActivity
+        embed: true
+      - target: LifeRecordWatch
+        embed: true
+      - package: LifeUI
+      - package: LifeStore
+      - package: LifeCore
+      - sdk: libsqlite3.tbd
+      - sdk: CoreLocation.framework
+      - sdk: CoreMotion.framework
+      - sdk: MapKit.framework
+      - sdk: ActivityKit.framework
+  LifeRecordWatch:
+    type: application
+    platform: watchOS
+    deploymentTarget: "10.0"
+    sources:
+      - path: App/Watch
+        excludes: ["Info.plist"]
+    info:
+      path: App/Watch/Info.plist
+      properties:
+        CFBundleDisplayName: 人生计时
+        WKApplication: true
+        WKCompanionAppBundleIdentifier: local.liferecord.ios
+        WKRunsIndependentlyOfCompanionApp: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.liferecord.ios.watch
+        PRODUCT_NAME: LifeRecordWatch
+        PRODUCT_MODULE_NAME: LifeRecordWatch
+        ASSETCATALOG_COMPILER_APPICON_NAME: LifeWatchIcon
+        TARGETED_DEVICE_FAMILY: "4"
+        SKIP_INSTALL: YES
+    dependencies:
+      - sdk: WatchConnectivity.framework
+      - sdk: SwiftUI.framework
+  LifeTimerActivity:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: App/TimerActivity/TimeActivityAttributes.swift
+      - path: App/TimerActivity/TimerActivityWidget.swift
+    info:
+      path: App/TimerActivity/Info.plist
+      properties:
+        CFBundleDisplayName: 人生计时
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.liferecord.ios.timeractivity
+        PRODUCT_NAME: LifeTimerActivity
+        PRODUCT_MODULE_NAME: LifeTimerActivity
+        CODE_SIGNING_ALLOWED: NO
+        APPLICATION_EXTENSION_API_ONLY: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SKIP_INSTALL: YES
+    dependencies:
+      - sdk: ActivityKit.framework
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+
+schemes:
+  LifeRecordMac:
+    build:
+      targets:
+        LifeRecordMac: all
+  LifeRecordiOS:
+    build:
+      targets:
+        LifeRecordiOS: all
+
+  LifeRecordWatch:
+    build:
+      targets:
+        LifeRecordWatch: all
