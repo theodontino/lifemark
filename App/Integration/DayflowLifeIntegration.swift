@@ -14,6 +14,23 @@ enum DayflowLifeIntegration {
         return value
     }()
 
+    /// Converts both current Chinese labels and the upstream defaults into LifeRecord's vocabulary.
+    nonisolated static func lifeCategory(for raw: String) -> String {
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "工作", "work", "communication", "coding / debugging", "code review",
+             "engineering / product", "research & strategy", "data & insights",
+             "specs & planning", "analysis & modeling", "data engineering": return "工作"
+        case "学习", "study", "studying", "learning", "research", "assignments",
+             "research & analysis": return "学习"
+        case "创作", "creation", "creative", "design", "writing": return "创作"
+        case "通勤", "commute", "commuting", "transport": return "通勤"
+        case "生活", "personal", "life": return "生活"
+        case "娱乐", "distraction", "entertainment", "leisure": return "娱乐"
+        case "休息", "rest", "sleep": return "休息"
+        default: return "待分类"
+        }
+    }
+
     private static var isSyncing = false
     private static var needsAnotherSnapshot = false
 
@@ -37,6 +54,7 @@ enum DayflowLifeIntegration {
         do {
             let store = try LifeIntegrationStore.result.get()
             let sourceDevice = deviceID
+            let idleCategoryName = CategoryStore.shared.idleCategory?.name
             let windowStart = Date(timeIntervalSince1970: 946684800)
             let windowEnd = Date()
             let summaries: [ScreenSummary] = try await Task.detached(priority: .utility) {
@@ -48,14 +66,21 @@ enum DayflowLifeIntegration {
                           AND start_ts >= ? AND end_ts <= ?
                         ORDER BY start_ts, id
                         """, arguments: [Int(windowStart.timeIntervalSince1970), Int(windowEnd.timeIntervalSince1970)])
-                    return try rows.map { row in
+                    // Exclude only the source's system Idle cards. Still reconcile the complete
+                    // successful snapshot, even when empty, so LifeStore preserves manual edits.
+                    return try rows.compactMap { row -> ScreenSummary? in
+                        if let category: String = row["category"], let idleCategoryName,
+                           category.trimmingCharacters(in: .whitespacesAndNewlines)
+                            .caseInsensitiveCompare(idleCategoryName.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame {
+                            return nil
+                        }
                         guard let id: Int64 = row["id"], let start: Int = row["start_ts"],
                               let end: Int = row["end_ts"], end > start,
                               let title: String = row["title"], let category: String = row["category"] else {
                             throw NSError(domain: "LifeRecord.DayflowImport", code: 1,
                                           userInfo: [NSLocalizedDescriptionKey: "屏幕摘要数据不完整，本次未覆盖已有记录。"])
                         }
-                        return ScreenSummary(id: String(id), title: title, category: category,
+                        return ScreenSummary(id: String(id), title: title, category: Self.lifeCategory(for: category),
                                              start: Date(timeIntervalSince1970: TimeInterval(start)),
                                              end: Date(timeIntervalSince1970: TimeInterval(end)),
                                              summary: row["summary"] ?? "", deviceID: sourceDevice)

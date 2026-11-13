@@ -80,7 +80,7 @@ final class AnalysisManager: AnalysisManaging {
   func startAnalysisJob() {
     stopAnalysisJob()  // ensure single timer
     DispatchQueue.main.async { [weak self] in
-      guard let self else { return }
+      guard let self, LifeScreenAnalysisPolicy.isAllowed() else { return }
       self.analysisTimer = Timer.scheduledTimer(
         timeInterval: self.checkInterval,
         target: self,
@@ -371,7 +371,11 @@ final class AnalysisManager: AnalysisManaging {
     _ batchId: Int64, stepHandler: @escaping (LLMProcessingStep) -> Void,
     completion: @escaping (Result<Void, Error>) -> Void
   ) {
+    let admittedSession = LifeScreenAnalysisPolicy.sessionID
     queue.async { [weak self] in
+      guard LifeScreenAnalysisPolicy.isAllowed(), admittedSession == LifeScreenAnalysisPolicy.sessionID else {
+        completion(.failure(CancellationError())); return
+      }
       guard let self = self else {
         DispatchQueue.main.async {
           completion(
@@ -489,7 +493,7 @@ final class AnalysisManager: AnalysisManaging {
     let cutoff = Int(now.timeIntervalSince1970 - maxLookback)
     let recentFailedBatches = store.allBatches()
       .filter { $0.status == "failed" || $0.status == "processing" }
-      .filter { $0.start >= cutoff && !isBatchInFlight($0.id) }
+      .filter { $0.start >= max(cutoff, LifeScreenAnalysisPolicy.sessionStart) && !isBatchInFlight($0.id) }
       .filter { automaticRetryCounts[$0.id, default: 0] < maxAutomaticRetriesPerBatch }
       .sorted { $0.start < $1.start }
     guard !recentFailedBatches.isEmpty else { return [] }
@@ -515,7 +519,7 @@ final class AnalysisManager: AnalysisManaging {
   }
 
   private func processRecordings() {
-    guard !isProcessing else { return }
+    guard LifeScreenAnalysisPolicy.isAllowed(), !isProcessing else { return }
     isProcessing = true
     defer { isProcessing = false }
 
@@ -534,7 +538,11 @@ final class AnalysisManager: AnalysisManaging {
     progressHandler: ((LLMProcessingStep) -> Void)? = nil,
     completion: ((Result<Void, Error>) -> Void)? = nil
   ) {
+    guard LifeScreenAnalysisPolicy.isAllowed() else { completion?(.failure(CancellationError())); return }
     let screenshotsInBatch = store.screenshotsForBatch(batchId)
+    guard screenshotsInBatch.allSatisfy({ $0.capturedAt >= LifeScreenAnalysisPolicy.sessionStart }) else {
+      completion?(.failure(CancellationError())); return
+    }
 
     guard !screenshotsInBatch.isEmpty else {
       print("Warning: Batch \(batchId) has no screenshots. Marking as 'failed_empty'.")
@@ -751,7 +759,7 @@ final class AnalysisManager: AnalysisManaging {
 
   private func fetchUnprocessedScreenshots() -> [Screenshot] {
     let oldest = Int(Date().timeIntervalSince1970) - Int(maxLookback)
-    return store.fetchUnprocessedScreenshots(since: oldest)
+    return store.fetchUnprocessedScreenshots(since: max(oldest, LifeScreenAnalysisPolicy.sessionStart))
   }
 
   private func createScreenshotBatches(from screenshots: [Screenshot]) -> [ScreenshotBatch] {

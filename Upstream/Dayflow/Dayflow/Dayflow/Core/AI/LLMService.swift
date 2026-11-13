@@ -6,6 +6,7 @@
 import AppKit
 import Combine
 import Foundation
+import LifeUI
 import GRDB
 import SwiftUI
 
@@ -196,17 +197,11 @@ final class LLMService: LLMServicing {
     return saved.isEmpty ? "http://localhost:11434" : saved
   }
 
-  private func makeOpenAICompatibleProvider() -> OpenAICompatibleProvider? {
-    guard let configuration = OpenAICompatiblePreferences.load(), configuration.isComplete else {
-      print("❌ [LLMService] OpenAI-compatible provider unavailable: incomplete configuration")
-      return nil
-    }
-    let apiKey = KeychainManager.shared.retrieve(for: OpenAICompatiblePreferences.keychainProvider)
-    let runtimeConfiguration = OpenAICompatibleRuntimeConfiguration(
-      configuration: configuration,
-      bearerToken: apiKey
-    )
-    return OpenAICompatibleProvider(configuration: runtimeConfiguration)
+  private func makeOpenAICompatibleProvider(sessionID: String? = nil) -> OpenAICompatibleProvider? {
+    guard LifeScreenAnalysisPolicy.isAllowed(), let configuration = LifeScreenAnalysisPolicy.configuration(),
+          let apiKey = try? LifeAIConfiguration.readAPIKey() else { return nil }
+    let runtimeConfiguration = OpenAICompatibleRuntimeConfiguration(configuration: configuration, bearerToken: apiKey)
+    return OpenAICompatibleProvider(configuration: runtimeConfiguration, sessionID: sessionID)
   }
 
   private func providerLabel(for providerID: LLMProviderID) -> String {
@@ -223,7 +218,7 @@ final class LLMService: LLMServicing {
     )
   }
 
-  private func makeBatchProvider(for providerID: LLMProviderID) throws -> (
+  private func makeBatchProvider(for providerID: LLMProviderID, sessionID: String? = nil) throws -> (
     actions: BatchProviderActions, fallbackState: GemmaFallbackState?
   ) {
     switch providerID {
@@ -300,7 +295,7 @@ final class LLMService: LLMServicing {
         ), fallbackState: nil
       )
     case .openAICompatible:
-      guard let provider = makeOpenAICompatibleProvider() else { throw noProviderError() }
+      guard let provider = makeOpenAICompatibleProvider(sessionID: sessionID) else { throw noProviderError() }
       return (
         actions: BatchProviderActions(
           transcribeScreenshots: provider.transcribeScreenshots,
@@ -328,10 +323,10 @@ final class LLMService: LLMServicing {
     }
   }
 
-  private func makeTimelineProviderContext(for providerID: LLMProviderID) throws
+  private func makeTimelineProviderContext(for providerID: LLMProviderID, sessionID: String? = nil) throws
     -> TimelineProviderContext
   {
-    let providerBundle = try makeBatchProvider(for: providerID)
+    let providerBundle = try makeBatchProvider(for: providerID, sessionID: sessionID)
     return TimelineProviderContext(
       id: providerID,
       providerLabel: providerLabel(for: providerID),
@@ -651,7 +646,11 @@ final class LLMService: LLMServicing {
     _ batchId: Int64, progressHandler: ((LLMProcessingStep) -> Void)? = nil,
     completion: @escaping (Result<ProcessedBatchResult, Error>) -> Void
   ) {
+    let admittedSession = LifeScreenAnalysisPolicy.sessionID
     Task {
+      guard LifeScreenAnalysisPolicy.isAllowed(), admittedSession == LifeScreenAnalysisPolicy.sessionID else {
+        completion(.failure(CancellationError())); return
+      }
       var holdsTimelineCardGenerationGate = false
       defer {
         if holdsTimelineCardGenerationGate {
@@ -671,13 +670,8 @@ final class LLMService: LLMServicing {
       }
 
       let (_, batchStartTs, batchEndTs, _) = batchInfo
-      let routing: LLMProviderRouting
-      do {
-        routing = try LLMProviderRoutingStore.load()
-      } catch {
-        completion(.failure(error))
-        return
-      }
+      guard batchStartTs >= LifeScreenAnalysisPolicy.sessionStart else { completion(.failure(CancellationError())); return }
+      let routing = LLMProviderRouting(primary: .openAICompatible)
       let processingStartTime = Date()
       let primaryProviderID = routing.primary
       let primaryProviderLabel = providerLabel(for: primaryProviderID)
@@ -712,11 +706,11 @@ final class LLMService: LLMServicing {
           ])
 
         let primaryResult: Result<TimelineProviderContext, Error> = Result {
-          try makeTimelineProviderContext(for: primaryProviderID)
+          try makeTimelineProviderContext(for: primaryProviderID, sessionID: admittedSession)
         }
         let configuredBackupContext: TimelineProviderContext? = {
           guard let configuredBackup else { return nil }
-          return try? makeTimelineProviderContext(for: configuredBackup)
+          return try? makeTimelineProviderContext(for: configuredBackup, sessionID: admittedSession)
         }()
         backupConfigured = configuredBackupContext != nil
         if let configuredBackup, configuredBackupContext == nil {

@@ -9,11 +9,13 @@ final class OpenAICompatibleProvider: ChatGPTTimelinePromptSupporting {
   private let transport: OllamaProvider
   private let configuration: OpenAICompatibleRuntimeConfiguration
   private let completion: Completion?
+  private let sessionID: String
 
-  init(configuration: OpenAICompatibleRuntimeConfiguration, completion: Completion? = nil) {
+  init(configuration: OpenAICompatibleRuntimeConfiguration, completion: Completion? = nil, sessionID: String? = nil) {
     self.configuration = configuration
     self.transport = OllamaProvider(openAICompatible: configuration)
     self.completion = completion
+    self.sessionID = sessionID ?? LifeScreenAnalysisPolicy.sessionID
   }
 
   func makeRequest(content: [MessageContent]) -> ChatRequest {
@@ -41,6 +43,7 @@ final class OpenAICompatibleProvider: ChatGPTTimelinePromptSupporting {
     -> String
   {
     if let completion { return try await completion(request, operation, batchId) }
+    guard LifeScreenAnalysisPolicy.requestAllowed(configuration, sessionID: sessionID) else { throw CancellationError() }
     let response = try await transport.callChatAPI(
       request, operation: operation, batchId: batchId, maxRetries: 1)
     return response.choices.first?.message.content ?? ""

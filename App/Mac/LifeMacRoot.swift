@@ -6,7 +6,7 @@ struct LifeMacRoot: View {
     var body: some View {
         Group {
             if let store = LifeIntegrationStore.shared {
-                LifeRootView(store: store, capturePanel: AnyView(LifeMacCapturePanel()), nearbyController: LifeIntegrationStore.nearby)
+                LifeRootView(store: store, capturePanel: AnyView(LifeScreenCapturePanel()), nearbyController: LifeIntegrationStore.nearby)
                     .task { LifeIntegrationStore.nearby?.start(); LifeTimerOverlay.shared.install(); importError = await syncDayflowSummaries() }
                     .onReceive(NotificationCenter.default.publisher(for: .timelineDataUpdated)) { _ in
                         Task { importError = await syncDayflowSummaries() }
@@ -20,24 +20,3 @@ struct LifeMacRoot: View {
         }
     }
 }
-struct LifeMacCapturePanel: View {
-    @Environment(\.openWindow) private var openWindow
-    @ObservedObject private var state = AppState.shared
-    @ObservedObject private var overlay = LifeTimerOverlay.shared
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Picker("计时条的位置", selection: $overlay.usesIsland) {
-                Text("贴在刘海两侧（会盖住刘海旁的一小段菜单栏）").tag(true)
-                Text("挂在菜单栏下面（不遮挡菜单栏）").tag(false)
-            }
-            Divider()
-            Label(state.isRecording ? "正在生成屏幕线索" : "屏幕记录已暂停", systemImage: state.isRecording ? "record.circle" : "pause.circle")
-            Button("打开屏幕记录与模型设置") { openWindow(id: "main") }
-            if state.isRecording {
-                Button("暂停屏幕记录") { AppState.shared.setRecording(false, analyticsReason: "manual", persistPreference: true) }
-            }
-            Text("请在屏幕设置中完成权限和模型配置，再主动开启记录。新线索先进入待核对区；录屏不会放进 iCloud。原采集设置部分为英文。").font(.caption).foregroundStyle(.secondary)
-        }
-    }
-}
-

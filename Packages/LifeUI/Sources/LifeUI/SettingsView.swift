@@ -21,6 +21,7 @@ struct LifeBackup: FileDocument {
     @AppStorage("life.ai.model") private var model = ""
     @State private var key = ""
     @State private var keyLoaded = false
+    @State private var persistedKey = ""
     @State private var keySaveFailed = false
     @State private var error: String?
     @State private var status: String?
@@ -47,14 +48,14 @@ struct LifeBackup: FileDocument {
                 Text("遇到没有该日期的月份，使用当月最后一天。自然月平均另按每月1日起统计。").font(.caption).foregroundStyle(.secondary)
             }
             Section("云端 AI · 兼容接口") {
-                Toggle("允许主动调用 AI",isOn:$aiEnabled)
+                Toggle("允许调用 AI",isOn:$aiEnabled)
                 TextField("API根地址，如 https://服务地址/v1/",text:$baseURL)
                 TextField("模型名称",text:$model)
                 SecureField("API密钥（保存在本机钥匙串）",text:$key).disabled(!keyLoaded)
                 if !keyLoaded { Button("重新读取钥匙串") { loadKey() } }
                 if keySaveFailed { Button("重试保存密钥") { saveKey() } }
                 Text("地址、模型和密钥修改后自动保存。密钥保存在本机钥匙串。").font(.caption).foregroundStyle(.secondary)
-                Text("截图识别发送OCR文字；回顾发送页面列出的汇总。费用按你的服务商规则收取。此设置与屏幕引擎的模型设置暂分别配置。").font(.caption).foregroundStyle(.secondary)
+                Text("截图识别发送OCR文字；回顾发送页面列出的汇总。费用按你的服务商规则收取。Mac 屏幕记录也使用这份配置，需另行开启，并会发送抽样屏幕图片。").font(.caption).foregroundStyle(.secondary)
             }
             if let capturePanel { Section("自动记录") { capturePanel } }
             Section("回顾的口径") {
@@ -71,6 +72,9 @@ struct LifeBackup: FileDocument {
             if error != nil || store.errorMessage != nil { Section { ErrorText(text:error ?? store.errorMessage) } }
         }.formStyle(.grouped).keyboardDismissible().navigationTitle("设置")
             .task { loadKey() }
+            .onChange(of: aiEnabled) { _, _ in configurationChanged() }
+            .onChange(of: baseURL) { _, _ in configurationChanged() }
+            .onChange(of: model) { _, _ in configurationChanged() }
             .onChange(of: key) { _, _ in
                 saveKey()
             }
@@ -78,14 +82,15 @@ struct LifeBackup: FileDocument {
                 switch result { case .success: status = "记录已导出。"; case .failure(let e): error = e.localizedDescription }
             }
     }
+    private func configurationChanged() { NotificationCenter.default.post(name: LifeAIConfiguration.didChange, object: nil) }
     private func loadKey() {
         keyLoaded = false
-        do { key = try LifeKeychain.read(); keyLoaded = true; error = nil }
+        do { let loaded = try LifeKeychain.read(); persistedKey = loaded; key = loaded; keyLoaded = true; error = nil }
         catch { self.error = "无法读取密钥，请重试读取后再编辑：" + error.localizedDescription }
     }
     private func saveKey() {
-        guard keyLoaded else { return }
-        do { try LifeKeychain.save(key); keySaveFailed = false; status = "密钥已自动保存。"; error = nil }
+        guard keyLoaded, key != persistedKey else { return }
+        do { try LifeKeychain.save(key); persistedKey = key; keySaveFailed = false; status = "密钥已自动保存。"; error = nil; configurationChanged() }
         catch { keySaveFailed = true; status = nil; self.error = "密钥未保存，请重试：" + error.localizedDescription }
     }
 }

@@ -78,7 +78,12 @@ extension TimelineOutputSupporting {
 
   func normalizeCategory(_ raw: String, descriptors: [LLMCategoryDescriptor]) -> String {
     let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !cleaned.isEmpty else { return descriptors.first?.name ?? "" }
+    let fallback = descriptors.first(where: {
+      $0.name.trimmingCharacters(in: .whitespacesAndNewlines) == "待分类"
+    }) ?? descriptors.first(where: {
+      $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "uncategorized"
+    }) ?? descriptors.first
+    guard !cleaned.isEmpty else { return fallback?.name ?? "" }
     let normalized = cleaned.lowercased()
     if let match = descriptors.first(where: {
       $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalized
@@ -91,7 +96,7 @@ extension TimelineOutputSupporting {
         return idle.name
       }
     }
-    return descriptors.first?.name ?? cleaned
+    return fallback?.name ?? cleaned
   }
 
   func normalizeCards(_ cards: [ActivityCardData], descriptors: [LLMCategoryDescriptor])

@@ -33,6 +33,12 @@ enum LifeKeychain {
         } else if update != errSecSuccess { throw LifeAIError.message("无法更新密钥（\(update)）。") }
     }
 }
+/// Shared local settings used by manual AI and the embedded screen engine.
+public enum LifeAIConfiguration {
+    public static let didChange = Notification.Name("LifeRecord.aiConfigurationChanged")
+    public static func readAPIKey() throws -> String { try LifeKeychain.read() }
+    public static func saveAPIKey(_ value: String) throws { try LifeKeychain.save(value) }
+}
 private final class SameOriginRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         guard let old = task.originalRequest?.url, let next = request.url,
