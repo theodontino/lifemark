@@ -15,3 +15,59 @@
 同步不依赖 Mac 常开：未来完成签名与云容器配置后，各设备直接与 Apple CloudKit 通信。`requestSync()` 可手动触发，已启动的 SyncEngine 负责自动同步。只有该调用真正返回时才显示“同步请求已完成”，不会把仅本机写入当作云端成功。
 
 测试：`swift test --scratch-path /private/tmp/liferecord-store-build`。本机权限受限环境需将 Swift/Clang 模块缓存指向 `/private/tmp`。
+
+
+## Nearby synchronization protocol 1
+
+`LifeStore` is main-actor isolated. The synchronous throwing entry points are
+`inventory()`, `exportBatch(excluding:limit:maxBytes:)`, and `importBatch(_:)`.
+All `Sync*` transport values are `Codable`, `Sendable`, and `Equatable`.
+Inventories contain sorted immutable revision UUIDs for records and timers.
+Exchange an inventory, export missing revisions, atomically import the page,
+then request another page using a fresh receiver inventory until `hasMore` is false.
+A lost acknowledgment can safely resend the identical page. Existing UUIDs are
+accepted only with identical content; a conflicting UUID never replaces data.
+
+Pages default to 256 revisions and 4 MiB of complete `JSONEncoder` output.
+The caller can choose 1–1024 revisions and 256 bytes–8 MiB. Import rejects more
+than 1024 revisions or 8 MiB. Parent closure must already exist on the receiver
+or travel in the same page. A timer revision and its referenced TimeBlock
+revision form one indivisible missing-dependency group. Groups that do not fit
+are deferred, while smaller independent groups can make progress; an empty
+page with remaining oversized data throws an explicit error. Every page must
+be imported before its updated inventory is used to export the next page.
+
+Wire fields are stable for protocol 1: `SyncInventory` carries
+`protocolVersion`, `recordRevisionIDs`, `timerRevisionIDs`; `SyncBatch` carries
+`protocolVersion`, `recordRevisions`, `timerRevisions`, `hasMore`.
+`SyncRecordRevision` preserves `id`, `entityID`, `entityType`, opaque `payload`,
+`parentIDs`, `createdAt` (Unix seconds), `isDeleted`, and `origin`.
+`SyncTimerRevision` preserves `id`, `timerID`, opaque `payload`, `parentIDs`,
+and `createdAt` (Unix seconds). Payload JSON dates follow Foundation's default
+JSON date encoding (seconds since the 2001 reference date). A timer payload
+contains `timer`, `state` (`running`, `finished`, `cancelled`), and an optional
+`recordRevisionID`; a finished timer must reference its TimeBlock revision.
+
+Unknown protocol versions, malformed envelopes, UUID collisions, missing or
+cross-entity parents, cycles, and incomplete timer references reject the whole
+batch. Opaque damaged record payloads are stored unchanged and isolated by
+`recordReadIssues`, allowing independent healthy records to remain available.
+Only immutable logical revisions are exported: raw location evidence, images,
+settings, credentials, and keys are outside the protocol.
+
+`timerRevisions` is authoritative; `timerSessions` is a disposable running-timer
+projection. Conflicting timer tips and their ledger tips produce a single
+`RecordConflict(kind: "timer")`; running and completed projections are hidden
+until `resolveConflict(entityID:choosing:)` atomically joins both chains.
+Different timer IDs and both successors of offline switches remain independent.
+`LifeStore.didChangeNotification` and observable `changeGeneration` change only
+when the immutable revision set changes, including commits seen through another
+connection. Idempotent retransmission and watch retries do not increment it.
+
+Before migrating an existing store to v5, GRDB's online SQLite backup creates a
+sibling `*.pre-v5-<UUID>.sqlite`, validates it with `PRAGMA quick_check`, and
+includes committed WAL content. Migration preserves original revisions and
+seeds each preexisting running session once, retaining its ID and start time.
+Backups are retained; migration or backup failure aborts opening the store.
+The existing optional CloudKit configuration continues to synchronize only its
+previous record table; nearby synchronization carries the timer revision table.

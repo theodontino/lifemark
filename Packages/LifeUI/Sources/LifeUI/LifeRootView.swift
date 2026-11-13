@@ -1,6 +1,7 @@
 import SwiftUI
 import LifeCore
 import LifeStore
+import LifeNearby
 
 /// One destination per kind of content; analysis lives inside 时间 and 账本 rather than in a separate section.
 enum LifeSection: Int, CaseIterable, Identifiable {
@@ -17,8 +18,11 @@ enum LifeSection: Int, CaseIterable, Identifiable {
 @MainActor public struct LifeRootView: View {
     private let store: LifeStore
     private let capturePanel: AnyView?
+    private let nearbyController: NearbySyncController?
     @State private var section = LifeSection.now
-    public init(store: LifeStore, capturePanel: AnyView? = nil) { self.store = store; self.capturePanel = capturePanel }
+    public init(store: LifeStore, capturePanel: AnyView? = nil, nearbyController: NearbySyncController? = nil) {
+        self.store = store; self.capturePanel = capturePanel; self.nearbyController = nearbyController
+    }
     private var inboxCount: Int {
         store.transactions.filter { $0.status == .pending }.count + store.timeBlocks.filter { $0.status == .pending }.count
             + store.conflicts.count + store.recordReadIssues.count
@@ -51,7 +55,7 @@ enum LifeSection: Int, CaseIterable, Identifiable {
         case .time: TimeView(store: store)
         case .ledger: LedgerView(store: store)
         case .inbox: InboxView(store: store)
-        case .settings: SettingsView(store: store, capturePanel: capturePanel)
+        case .settings: SettingsView(store: store, capturePanel: capturePanel, nearbyController: nearbyController)
         }
     }
 
@@ -61,8 +65,12 @@ enum LifeSection: Int, CaseIterable, Identifiable {
             ForEach(LifeSection.allCases.filter { $0 != .settings }) { sidebarRow($0) }
             Spacer()
             sidebarRow(.settings)
-            Text(store.syncStatus).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.top, 6)
+            Text(syncLine).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.top, 6)
         }.padding(12).frame(maxHeight: .infinity).background(lifeSidebar)
+    }
+    private var syncLine: String {
+        if let nearbyController, nearbyController.enabled { return "附近同步：" + nearbyController.state }
+        return "仅本机保存"
     }
     private func sidebarRow(_ item: LifeSection) -> some View {
         let selected = section == item

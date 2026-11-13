@@ -159,6 +159,27 @@ const double MPH_to_METERSPERSECOND = 0.447;
     [[NSUserDefaults standardUserDefaults] setBool:NO forKey:GLTrackingStateDefaultsName];
 }
 
+#pragma mark - LifeRecord visit capture
+
+// LifeRecord: the only capture mode the app offers. No continuous or significant-change
+// tracking: the system reports arrivals and departures, which costs very little battery.
+- (void)lifeStartVisitCapture {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setInteger:kGLTrackingModeOff forKey:GLSignificantLocationModeDefaultsName];
+    [defaults setBool:YES forKey:GLVisitTrackingEnabledDefaultsName];
+    [defaults setBool:NO forKey:GLNotificationsEnabledDefaultsName];
+    [self startAllUpdates];
+}
+
+- (void)lifeStopCapture {
+    [[NSUserDefaults standardUserDefaults] setBool:NO forKey:GLVisitTrackingEnabledDefaultsName];
+    [self stopAllUpdates];
+}
+
+- (BOOL)lifeCaptureEnabled {
+    return self.trackingEnabled && self.visitTrackingEnabled && self.trackingMode == kGLTrackingModeOff;
+}
+
 - (void)refreshLocation {
     NSLog(@"Trying to update location now");
     [self.locationManager stopUpdatingLocation];
@@ -1046,13 +1067,8 @@ const double MPH_to_METERSPERSECOND = 0.447;
     
     [UIDevice currentDevice].batteryMonitoringEnabled = YES;
     
-    if(CMMotionActivityManager.isActivityAvailable) {
-        [self.motionActivityManager startActivityUpdatesToQueue:[NSOperationQueue mainQueue] withHandler:^(CMMotionActivity *activity) {
-            self.lastMotion = activity;
-            [[NSNotificationCenter defaultCenter] postNotificationName:GLNewActivityNotification object:self];
-        }];
-    }
-    [[GLBarometer shared] start];
+    // LifeRecord: stays are recorded from visits only. Motion activity and the barometer are
+    // never started, so the app does not ask for Motion & Fitness access.
 
     NSLog(@"Location Authorization Status %@", self.authorizationStatusAsString);
     
@@ -1073,11 +1089,9 @@ const double MPH_to_METERSPERSECOND = 0.447;
     [self.locationManager stopUpdatingHeading];
     [self.locationManager stopUpdatingLocation];
     [self.locationManager stopMonitoringSignificantLocationChanges];
-    if(CMMotionActivityManager.isActivityAvailable) {
-        [self.motionActivityManager stopActivityUpdates];
-        self.lastMotion = nil;
-    }
-    [[GLBarometer shared] stop];
+    // LifeRecord: motion activity and the barometer are never started (see enableTracking), and
+    // touching them here would raise the Motion & Fitness prompt at launch.
+    self.lastMotion = nil;
     [self cancelLocalNotification];
 }
 

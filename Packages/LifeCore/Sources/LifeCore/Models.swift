@@ -59,8 +59,10 @@ public struct TimeBlock: Codable, Equatable, Sendable, Identifiable {
     public var source: RecordSource
     public var status: ReviewStatus
     public var evidence: String
-    public init(id: UUID = UUID(), title: String, category: String, start: Date, end: Date, note: String = "", source: RecordSource = .manual, status: ReviewStatus = .confirmed, evidence: String = "") {
-        self.id = id; self.title = title; self.category = category; self.start = start; self.end = end; self.note = note; self.source = source; self.status = status; self.evidence = evidence
+    /// Name the user gave to the place of a location stay. Coordinates are never stored here.
+    public var place: String?
+    public init(id: UUID = UUID(), title: String, category: String, start: Date, end: Date, note: String = "", source: RecordSource = .manual, status: ReviewStatus = .confirmed, evidence: String = "", place: String? = nil) {
+        self.id = id; self.title = title; self.category = category; self.start = start; self.end = end; self.note = note; self.source = source; self.status = status; self.evidence = evidence; self.place = place
     }
 }
 public struct AppData: Codable, Equatable, Sendable {

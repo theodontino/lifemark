@@ -12,6 +12,8 @@ settings:
     MARKETING_VERSION: 0.1.0
     ENABLE_USER_SCRIPT_SANDBOXING: NO
 packages:
+  LifeNearby:
+    path: Packages/LifeNearby
   LifeUI:
     path: Packages/LifeUI
   LifeStore:
@@ -43,6 +45,8 @@ targets:
       properties:
         CFBundleDisplayName: 人生记录
         LSApplicationCategoryType: public.app-category.productivity
+        NSLocalNetworkUsageDescription: 发现并连接你配对的附近设备，在设备之间加密同步账目、事项和计时。
+        NSBonjourServices: ["_liferecord._tcp"]
         NSScreenCaptureUsageDescription: 读取屏幕内容，帮助回顾实际做过的事情；你可以随时暂停。
         NSAppleEventsUsageDescription: 在你选择时读取浏览器活动背景，用于回顾。
         NSMicrophoneUsageDescription: 仅在你主动使用上游语音功能时访问麦克风。
@@ -61,6 +65,7 @@ targets:
         DAYFLOW_BACKEND_URL: ""
         POSTHOG_API_KEY: ""
     dependencies:
+      - package: LifeNearby
       - package: LifeUI
       - package: LifeStore
       - package: LifeCore
@@ -104,7 +109,9 @@ targets:
         NSLocationAlwaysAndWhenInUseUsageDescription: 你开启后台记录后，记录地点停留，辅助回顾一天。
         NSMotionUsageDescription: 你开启记录后，用运动状态辅助识别通勤线索。
         NSPhotoLibraryUsageDescription: 选择付款截图，核对后记账。
-        NSLocalNetworkUsageDescription: 仅在主动使用原定位器网络功能时连接。
+        NSLocalNetworkUsageDescription: 发现并连接你配对的附近设备，在设备之间加密同步账目、事项和计时。
+        NSBonjourServices: ["_liferecord._tcp"]
+        NSCameraUsageDescription: 仅在你选择扫码配对时扫描 Mac 上的配对二维码。
         NSHealthShareUsageDescription: 仅在你主动使用原定位器健康功能时读取。
         NSHealthUpdateUsageDescription: 仅在你主动使用原定位器健康功能时写入。
         UIBackgroundModes: [location, remote-notification]
@@ -127,6 +134,7 @@ targets:
         embed: true
       - target: LifeRecordWatch
         embed: true
+      - package: LifeNearby
       - package: LifeUI
       - package: LifeStore
       - package: LifeCore

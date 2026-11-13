@@ -178,7 +178,9 @@ struct DayTimeline: View {
                     }
                 }.frame(width: 42, height: total, alignment: .topLeading).accessibilityHidden(true)
                 GeometryReader { geometry in
-                    let laneWidth = max(60, (geometry.size.width - CGFloat(plan.lanes - 1) * 6) / CGFloat(plan.lanes))
+                    let laneWidth = max(96, (geometry.size.width - CGFloat(plan.lanes - 1) * 6) / CGFloat(plan.lanes))
+                    let needed = CGFloat(plan.lanes) * (laneWidth + 6) - 6
+                    ScrollView(.horizontal, showsIndicators: needed > geometry.size.width + 1) {
                     ZStack(alignment: .topLeading) {
                         ForEach(0...plan.hours, id: \.self) { hour in
                             Rectangle().fill(lifeLine).frame(height: 1).offset(y: CGFloat(hour) * hourHeight)
@@ -187,7 +189,8 @@ struct DayTimeline: View {
                             card(entry).frame(width: laneWidth, height: entry.height)
                                 .offset(x: CGFloat(entry.lane) * (laneWidth + 6), y: entry.top)
                         }
-                    }
+                    }.frame(width: max(needed, geometry.size.width), height: total, alignment: .topLeading)
+                    }.scrollDisabled(needed <= geometry.size.width + 1)
                 }.frame(height: total)
             }.padding(.top, 8)
         }

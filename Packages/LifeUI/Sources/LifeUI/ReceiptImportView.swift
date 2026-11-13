@@ -72,7 +72,7 @@ enum LifeOCR {
                     Button("核对完成，入账") { save(confirmed:true) }.buttonStyle(.borderedProminent).disabled(busy)
                     Button("保存草稿，稍后核对") { save(confirmed:false) }.disabled(busy)
                 }
-            }.formStyle(.grouped).disabled(busy).navigationTitle("截图记账")
+            }.formStyle(.grouped).keyboardDismissible().disabled(busy).navigationTitle("截图记账")
                 .toolbar { ToolbarItem(placement:.cancellationAction) { Button("关闭") { dismiss() } } }
                 .fileImporter(isPresented:$choosing,allowedContentTypes:[.image]) { result in
                     Task {

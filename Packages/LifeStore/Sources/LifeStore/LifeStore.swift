@@ -74,12 +74,15 @@ public struct RecordReadIssue: Identifiable, Equatable, Sendable {
 @MainActor @Observable
 public final class LifeStore {
     public private(set) var transactions: [LifeCore.Transaction] = []
-    public private(set) var timeBlocks: [TimeBlock] = []
+    public internal(set) var timeBlocks: [TimeBlock] = []
     public internal(set) var runningTimers: [RunningTimer] = []
-    public private(set) var recordReadIssues: [RecordReadIssue] = []
-    public private(set) var conflicts: [RecordConflict] = []
+    public internal(set) var recordReadIssues: [RecordReadIssue] = []
+    public internal(set) var conflicts: [RecordConflict] = []
     public private(set) var syncStatus = "仅本机 · iCloud 尚未配置"
     public var errorMessage: String?
+    public private(set) var changeGeneration: UInt64 = 0
+    public static let didChangeNotification = Notification.Name("local.liferecord.syncContentChanged")
+    @ObservationIgnored private var observedContent: Set<UUID>?
     @ObservationIgnored private let commitObserver = LocalCommitObserver()
     @ObservationIgnored private let databasePath: String
     @ObservationIgnored let database: DatabaseQueue
@@ -97,7 +100,9 @@ public final class LifeStore {
         }
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         databasePath = url.standardizedFileURL.path
-        database = try DatabaseQueue(path: url.path)
+        var configuration = Configuration()
+        configuration.busyMode = .timeout(5)
+        database = try DatabaseQueue(path: url.path, configuration: configuration)
         cloudIdentifier = cloudContainerIdentifier
         var migrator = DatabaseMigrator()
         migrator.registerMigration("v1-immutable-revisions") { db in
@@ -136,10 +141,38 @@ public final class LifeStore {
                 ) STRICT;
                 """)
         }
+        // SQLite's online backup includes committed WAL contents. Never copy just the .sqlite file.
+        let needsBackup = try database.read { db in
+            try db.tableExists("grdb_migrations") && String.fetchOne(db, sql: "SELECT identifier FROM grdb_migrations WHERE identifier = 'v5-nearby-timer-revisions'") == nil
+        }
+        if needsBackup {
+            let backupURL = url.deletingPathExtension().appendingPathExtension("pre-v5-\(UUID().uuidString).sqlite")
+            let destination = try DatabaseQueue(path: backupURL.path)
+            try database.backup(to: destination)
+            guard try destination.read({ try String.fetchOne($0, sql: "PRAGMA quick_check") }) == "ok" else {
+                throw LifeStoreError.invalidRecord("迁移前数据库备份未通过检查，原数据库尚未迁移。")
+            }
+            try destination.close()
+        }
+        migrator.registerMigration("v5-nearby-timer-revisions") { db in
+            try db.execute(sql: """
+                CREATE TABLE timerRevisions (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  timerID TEXT NOT NULL,
+                  payload TEXT NOT NULL,
+                  parentIDsJSON TEXT NOT NULL,
+                  createdAt REAL NOT NULL
+                ) STRICT;
+                CREATE INDEX timerRevisionEntity ON timerRevisions(timerID);
+                """)
+            for session in try TimerSessionRecord.fetchAll(db) {
+                try Self.insertTimerRevision(db, payload: TimerRevisionPayload(timer: session.timer, state: .running), parents: [])
+            }
+        }
         try migrator.migrate(database)
         try refresh()
         observation = ValueObservation.tracking { db in
-            (try RecordRevision.fetchAll(db), try TimerSessionRecord.fetchAll(db))
+            (try RecordRevision.fetchAll(db), try TimerRevision.fetchAll(db))
         }
             .start(in: database, onError: { [weak self] error in
                 Task { @MainActor in self?.errorMessage = error.localizedDescription }
@@ -162,16 +195,23 @@ public final class LifeStore {
 
     public func refresh() throws {
         let snapshot = try database.read { db in
-            (try RecordRevision.fetchAll(db), try TimerSessionRecord.fetchAll(db))
+            (try RecordRevision.fetchAll(db), try TimerRevision.fetchAll(db))
         }
         try apply(snapshot.0)
-        runningTimers = snapshot.1.map(\.timer).sorted {
-            $0.start == $1.start ? $0.id.uuidString < $1.id.uuidString : $0.start < $1.start
+        applyTimerRevisions(snapshot.1, records: snapshot.0)
+        if let warning = recordReadWarning { errorMessage = warning }
+        let content = Set(snapshot.0.map(\.id) + snapshot.1.map(\.id))
+        let changed = observedContent.map { $0 != content } ?? false
+        observedContent = content
+        if changed {
+            changeGeneration &+= 1
+            NotificationCenter.default.post(name: Self.didChangeNotification, object: self)
         }
     }
     func refreshAndNotify() throws {
+        let before = changeGeneration
         try refresh()
-        NotificationCenter.default.post(name: localCommitNotification, object: databasePath)
+        if changeGeneration != before { NotificationCenter.default.post(name: localCommitNotification, object: databasePath) }
     }
 
     private func apply(_ rows: [RecordRevision]) throws {
@@ -191,11 +231,11 @@ public final class LifeStore {
                 do {
                     if revision.entityType == "transaction" {
                         let item = try JSONDecoder().decode(LifeCore.Transaction.self, from: Data(revision.payload.utf8))
-                        guard item.id == entityID else { throw LifeStoreError.invalidRecord("收支记录标识与版本不一致。") }
+                        guard item.id == entityID, item.amountCents > 0, item.amountCents <= 1_000_000_000_000, Self.validDate(item.date) else { throw LifeStoreError.invalidRecord("收支记录内容与版本不一致。") }
                         money.append(item)
                     } else if revision.entityType == "timeBlock" {
                         let item = try JSONDecoder().decode(TimeBlock.self, from: Data(revision.payload.utf8))
-                        guard item.id == entityID else { throw LifeStoreError.invalidRecord("时间记录标识与版本不一致。") }
+                        guard item.id == entityID, Self.validDate(item.start), Self.validDate(item.end), item.end > item.start else { throw LifeStoreError.invalidRecord("时间记录内容与版本不一致。") }
                         blocks.append(item)
                     } else { throw LifeStoreError.invalidRecord("未知记录类型。") }
                 } catch {
@@ -213,7 +253,7 @@ public final class LifeStore {
         conflicts = issues.sorted { $0.entityID.uuidString < $1.entityID.uuidString }
     }
 
-    private var recordReadWarning: String? {
+    var recordReadWarning: String? {
         guard !recordReadIssues.isEmpty else { return nil }
         let ids = recordReadIssues.prefix(3).map { String($0.id.uuidString.prefix(8)) }.joined(separator: "、")
         return "有 \(recordReadIssues.count) 条记录无法解读，已隔离（版本 \(ids)）。其他记录仍可使用，原始数据库未删除；请保留备份后检查。"
@@ -260,6 +300,7 @@ public final class LifeStore {
         // Read current parents inside the same SQLite write transaction, so another window's edit
         // cannot be overwritten using stale in-memory parents.
         try database.write { db in
+            try Self.requireUnconflictedTimer(db, id: entityID)
             let rows = try RecordRevision.fetchAll(db).filter { $0.entityID == entityID.uuidString }
             let tips = Self.tips(rows)
             guard tips.count <= 1 else { throw LifeStoreError.unresolvedConflict }
@@ -287,11 +328,16 @@ public final class LifeStore {
         try refreshAndNotify()
     }
     nonisolated static func insert(_ db: Database, entityID: UUID, kind: String, payload: String, deleted: Bool, parents: [UUID], origin: String = "manual") throws {
+        try insertRevision(db, entityID: entityID, kind: kind, payload: payload, deleted: deleted, parents: parents, origin: origin)
+    }
+    @discardableResult nonisolated static func insertRevision(_ db: Database, entityID: UUID, kind: String, payload: String, deleted: Bool, parents: [UUID], origin: String = "manual") throws -> UUID {
         let revision = RecordRevision(id: UUID(), entityID: entityID.uuidString, entityType: kind, payload: payload, parentIDsJSON: try encode(parents), createdAt: Date().timeIntervalSince1970, isDeleted: deleted, origin: origin)
         try RecordRevision.insert { revision }.execute(db)
+        return revision.id
     }
     public func resolveConflict(entityID: UUID, choosing revisionID: UUID) throws {
         try database.write { db in
+            if try Self.resolveTimerConflict(db, entityID: entityID, choosing: revisionID) { return }
             let rows = try RecordRevision.fetchAll(db).filter { $0.entityID == entityID.uuidString }
             let tips = Self.tips(rows)
             guard tips.count > 1, let chosen = tips.first(where: { $0.id == revisionID }) else { throw LifeStoreError.missingRevision }
@@ -409,12 +455,13 @@ extension LifeStore {
         stableID("screen|\(summary.deviceID)|\(summary.start.timeIntervalSince1970)|\(summary.end.timeIntervalSince1970)")
     }
 
-    public func importLocationFeatures(_ data: Data) throws {
+    public func importLocationFeatures(_ data: Data, defaults: UserDefaults = .standard) throws {
         let json = try JSONSerialization.jsonObject(with: data)
         let root = json as? [String: Any]
         let features = root?["features"] as? [[String: Any]] ?? root?["locations"] as? [[String: Any]] ?? json as? [[String: Any]] ?? []
         guard !features.isEmpty else { throw LifeStoreError.invalidRecord("文件没有 Overland features 或 locations 数组。") }
         var blocks: [TimeBlock] = []
+        let places = PlaceBook.load(defaults)
         for feature in features {
             let properties = feature["properties"] as? [String: Any] ?? feature
             guard let arrival = Self.locationDate(properties["arrival_date"] ?? properties["arrivalDate"]),
@@ -422,9 +469,9 @@ extension LifeStore {
                   Self.validInterval(arrival, departure) else { continue }
             // CLLocation's distantPast/distantFuture sentinels and unfinished visits never become
             // multi-year blocks. Coordinates alone cannot establish what a person was doing.
-            let sourceID = (properties["device_id"] as? String ?? "overland") + "|\(arrival.timeIntervalSince1970)|\(departure.timeIntervalSince1970)"
-            let id = Self.stableID("visit|" + sourceID)
-            blocks.append(TimeBlock(id: id, title: "定位停留（待确认）", category: "未分类", start: arrival, end: departure, note: "定位只证明停留，不能判断当时做了什么。", source: .location, status: .pending, evidence: "Overland 已结束的停留事件；原始坐标未写入同步记录。"))
+            let id = Self.visitID(properties: properties, arrival: arrival, departure: departure)
+            let place = Self.coordinate(of: feature).flatMap { PlaceBook.match($0, in: places) }
+            blocks.append(TimeBlock(id: id, title: "定位停留（待确认）", category: "未分类", start: arrival, end: departure, note: "定位只证明停留，不能判断当时做了什么。", source: .location, status: .pending, evidence: "系统识别到的一次到访；坐标只保存在这台手机上。", place: place?.name))
         }
         // Persist all raw evidence locally before the capture adapter acknowledges its queue.
         // This table is deliberately excluded from SyncEngine's table list.
@@ -444,7 +491,15 @@ extension LifeStore {
         }
         try refreshAndNotify()
     }
-    nonisolated private static func locationDate(_ value: Any?) -> Date? {
+    nonisolated static func visitID(properties: [String: Any], arrival: Date, departure: Date) -> UUID {
+        stableID("visit|" + (properties["device_id"] as? String ?? "overland") + "|\(arrival.timeIntervalSince1970)|\(departure.timeIntervalSince1970)")
+    }
+    nonisolated static func coordinate(of feature: [String: Any]) -> (latitude: Double, longitude: Double)? {
+        guard let geometry = feature["geometry"] as? [String: Any], let pair = geometry["coordinates"] as? [Double], pair.count >= 2,
+              (-90...90).contains(pair[1]), (-180...180).contains(pair[0]) else { return nil }
+        return (pair[1], pair[0])
+    }
+    nonisolated static func locationDate(_ value: Any?) -> Date? {
         if let number = value as? Double {
             let date = Date(timeIntervalSince1970: number)
             return validDate(date) ? date : nil

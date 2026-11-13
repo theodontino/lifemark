@@ -7,28 +7,6 @@ private func timerClock(_ start: Date, now: Date = Date()) -> String {
     let s = max(0, Int(now.timeIntervalSince(start)))
     return String(format: "%02d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
 }
-@MainActor struct LifeTimerMenuLabel: View {
-    var body: some View {
-        if let timer = LifeIntegrationStore.shared?.runningTimers.first {
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                Text("◉ " + String(timer.title.prefix(9)) + " · " + timerClock(timer.start, now: context.date))
-                    .monospacedDigit()
-            }
-        } else { Label("计时", systemImage: "stopwatch") }
-    }
-}
-@MainActor struct LifeTimerMenuContent: View {
-    @Environment(\.openWindow) private var openWindow
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            if let store = LifeIntegrationStore.shared { LifeQuickTimerControls(store: store) }
-            else { Text(LifeIntegrationStore.openingError ?? "记录暂不可用") }
-            Divider()
-            Toggle("屏幕顶部悬浮条", isOn: Binding(get: { LifeTimerOverlay.shared.enabled }, set: { LifeTimerOverlay.shared.setEnabled($0) }))
-            Button("打开计时主界面") { openWindow(id: "life"); NSApp.activate(ignoringOtherApps: true) }
-        }.padding(18).frame(width: 340)
-    }
-}
 @MainActor final class LifeQuickTimerDraft: ObservableObject {
     @Published var title = ""
     @Published var category = "工作"
@@ -153,14 +131,27 @@ private func timerClock(_ start: Date, now: Date = Date()) -> String {
 private final class TimerFloatingPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+    // The island sits over the menu bar beside the notch; AppKit would otherwise push it below.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 @MainActor final class LifeTimerOverlay: ObservableObject {
     static let shared = LifeTimerOverlay()
-    @Published private(set) var enabled = UserDefaults.standard.object(forKey: "life.topTimer.enabled") as? Bool ?? true
+    // The bar under the notch is the only quick entry on the Mac (the menu bar item was removed
+    // because it repeated the same information), so it is always on while a timer runs.
+    @Published private(set) var enabled = true
     @Published var expanded = false
     private var panel: NSPanel?
     fileprivate let draft = LifeQuickTimerDraft()
-    @Published fileprivate var topInset: CGFloat = 0
+    /// Width of the camera housing, or nil on a display without one.
+    @Published fileprivate var notchWidth: CGFloat?
+    @Published fileprivate var barHeight: CGFloat = 34
+    /// How far the island extends on each side of the notch.
+    fileprivate static let earWidth: CGFloat = 118
+    /// The person's choice between the island beside the notch and the bar below it.
+    /// The island covers part of the menu bar; the bar never does.
+    @Published var usesIsland = UserDefaults.standard.object(forKey: "life.topTimer.island") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(usesIsland, forKey: "life.topTimer.island"); refresh() }
+    }
     private var installed = false
     private var screenObserver: NSObjectProtocol?
     func install() {
@@ -188,18 +179,32 @@ private final class TimerFloatingPanel: NSPanel {
             panel?.orderOut(nil); expanded = false; return
         }
         let inset = max(screen.safeAreaInsets.top, screen.frame.maxY - screen.visibleFrame.maxY)
-        topInset = inset
-        let width: CGFloat = expanded ? 360 : 300
-        let height: CGFloat = min(screen.frame.height - 80, inset + (expanded ? CGFloat(max(270, 150 + store.runningTimers.count * 115)) : 42))
+        let content: CGFloat = min(screen.frame.height - inset - 80, CGFloat(max(270, 150 + store.runningTimers.count * 115)))
+        // On a display with a notch the bar becomes an island: black "ears" extend the notch to both
+        // sides inside the menu bar, the way the Dynamic Island does on iPhone.
+        var notch: CGFloat?
+        if usesIsland, screen.safeAreaInsets.top > 0, let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea {
+            let width = screen.frame.width - left.width - right.width
+            if width > 40 { notch = width }
+        }
+        notchWidth = notch; barHeight = notch == nil ? 34 : inset
+        let width: CGFloat, height: CGFloat, top: CGFloat
+        if let notch {
+            width = notch + 2 * Self.earWidth; height = expanded ? inset + content : inset; top = screen.frame.maxY
+        } else {
+            // No notch (external display): hang directly below the menu bar.
+            width = expanded ? 360 : 300; height = expanded ? content : 34; top = screen.frame.maxY - inset
+        }
         if panel == nil {
             let p = TimerFloatingPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-            p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true
-            p.level = .floating; p.hidesOnDeactivate = false
-            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = false
+            // Above the menu bar, so the ears are drawn over it.
+            p.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2); p.hidesOnDeactivate = false
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
             p.contentView = NSHostingView(rootView: LifeTopTimerView(store: store, overlay: self))
             panel = p
         }
-        panel?.setFrame(NSRect(x: screen.frame.midX - width / 2, y: screen.frame.maxY - height, width: width, height: height), display: true)
+        panel?.setFrame(NSRect(x: screen.frame.midX - width / 2, y: top - height, width: width, height: height), display: true)
         panel?.orderFrontRegardless()
     }
 }
@@ -207,24 +212,37 @@ private final class TimerFloatingPanel: NSPanel {
     let store: LifeStore
     @ObservedObject var overlay: LifeTimerOverlay
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 0) {
             Button { overlay.toggleExpanded() } label: {
-                HStack {
-                    Image(systemName: "stopwatch")
-                    if let timer = store.runningTimers.first {
-                        Text(timer.title).lineLimit(1)
-                        Spacer(minLength: 4)
-                        TimelineView(.periodic(from: .now, by: 1)) { context in Text(timerClock(timer.start, now: context.date)).monospacedDigit() }
-                    }
-                    Image(systemName: overlay.expanded ? "chevron.up" : "chevron.down").font(.caption2)
-                }.font(.system(size: 12, weight: .medium)).contentShape(Rectangle())
+                HStack(spacing: 0) {
+                    HStack(spacing: 6) {
+                        Circle().fill(.orange).frame(width: 7, height: 7)
+                        if let timer = store.runningTimers.first { Text(timer.title).lineLimit(1).truncationMode(.tail) }
+                        if store.runningTimers.count > 1 { Text("+\(store.runningTimers.count - 1)").foregroundStyle(.white.opacity(0.7)) }
+                    }.frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 12)
+                    // The notch itself: nothing can be shown here.
+                    if let notch = overlay.notchWidth { Color.clear.frame(width: notch) }
+                    HStack(spacing: 5) {
+                        if let timer = store.runningTimers.first {
+                            TimelineView(.periodic(from: .now, by: 1)) { context in Text(timerClock(timer.start, now: context.date)).monospacedDigit() }
+                        }
+                        Image(systemName: overlay.expanded ? "chevron.up" : "chevron.down").font(.system(size: 9, weight: .semibold))
+                    }.frame(maxWidth: overlay.notchWidth == nil ? nil : .infinity, alignment: .trailing).padding(.trailing, 12)
+                }.font(.system(size: 12, weight: .medium)).frame(height: overlay.barHeight).contentShape(Rectangle())
             }.buttonStyle(.plain)
-            if overlay.expanded { ScrollView { LifeQuickTimerControls(store: store, draft: overlay.draft).font(.callout) } }
+                .accessibilityLabel(store.runningTimers.first.map { "正在计时：\($0.title)" } ?? "计时")
+                .accessibilityHint(overlay.expanded ? "收起" : "展开计时操作")
+            if overlay.expanded {
+                ScrollView { LifeQuickTimerControls(store: store, draft: overlay.draft).font(.callout) }
+                    .padding(.horizontal, 16).padding(.top, 12)
+                Picker("样式", selection: $overlay.usesIsland) { Text("贴在刘海两侧").tag(true); Text("挂在菜单栏下面").tag(false) }
+                    .pickerStyle(.segmented).labelsHidden().controlSize(.small)
+                    .padding(.horizontal, 16).padding(.vertical, 10).accessibilityLabel("计时条样式")
+            }
         }
-        .padding(.horizontal, 16).padding(.bottom, 12).padding(.top, overlay.topInset + 12)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .foregroundStyle(.white).tint(.orange)
-        .background(.black, in: UnevenRoundedRectangle(bottomLeadingRadius: 20, bottomTrailingRadius: 20))
+        .background(.black, in: UnevenRoundedRectangle(bottomLeadingRadius: overlay.expanded ? 18 : 11, bottomTrailingRadius: overlay.expanded ? 18 : 11))
         .environment(\.colorScheme, .dark).environment(\.locale, Locale(identifier: "zh_CN"))
     }
 }

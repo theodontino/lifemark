@@ -179,6 +179,11 @@ typedef void (^CaseBlock)(void);
 @property (strong, nonatomic, readonly) NSDate *lastSentDate;
 @property (strong, nonatomic, readonly) NSString *lastLocationName;
 
+// LifeRecord: visit-only capture used by the app's own settings
+- (void)lifeStartVisitCapture;
+- (void)lifeStopCapture;
+- (BOOL)lifeCaptureEnabled;
+
 - (void)startAllUpdates;
 - (void)stopAllUpdates;
 - (void)refreshLocation;

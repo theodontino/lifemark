@@ -10,6 +10,8 @@ import LifeStore
     @State private var discardingTransaction: LifeCore.Transaction?
     @State private var discardingBlock: TimeBlock?
     @State private var receipt = false
+    @State private var namingPlace: TimeBlock?
+    @State private var placeName = ""
     @State private var error: String?
     private var drafts: [LifeCore.Transaction] { store.transactions.filter { $0.status == .pending } }
     private var clues: [TimeBlock] { store.timeBlocks.filter { $0.status == .pending } }
@@ -51,6 +53,11 @@ import LifeStore
         .sheet(item: $transaction) { TransactionEditor(store: store, initial: $0) }
         .sheet(item: $block) { TimeEditor(store: store, initial: $0) }
         .sheet(isPresented: $receipt) { ReceiptImportView(store: store) }
+        .alert("这是哪里？", isPresented: Binding(get: { namingPlace != nil }, set: { if !$0 { namingPlace = nil } }), presenting: namingPlace) { item in
+            TextField("例如：家、学校、食堂", text: $placeName)
+            Button("取消", role: .cancel) {}
+            Button("保存") { run { try store.namePlace(for: item, name: placeName) } }
+        } message: { _ in Text("以后在这里的停留会自动带上这个名字。位置只保存在这台手机上。") }
         .confirmationDialog("丢弃这条草稿？", isPresented: Binding(get: { discardingTransaction != nil }, set: { if !$0 { discardingTransaction = nil } }),
                             titleVisibility: .visible, presenting: discardingTransaction) { item in
             Button("丢弃", role: .destructive) { run { try store.deleteTransaction(id: item.id, ifUnchangedFrom: item) } }
@@ -111,11 +118,16 @@ import LifeStore
         let needsTitle = item.source == .location || item.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let range = "\(relativeDay(item.start)) \(hourMinute(item.start)) – \(hourMinute(item.end))"
         return actionRow {
-            if needsTitle { Text("在某处停留了 " + durationText(item.end.timeIntervalSince(item.start))).fontWeight(.semibold) }
+            if needsTitle { Text("在\(item.place.map { "“\($0)”" } ?? "某处")停留了 " + durationText(item.end.timeIntervalSince(item.start))).fontWeight(.semibold) }
             else { Text(item.title + " · " + item.category).fontWeight(.semibold) }
             Text("来自\(item.source.label) · \(range)").font(.callout).foregroundStyle(.secondary)
         } actions: {
             Button("丢弃") { discardingBlock = item }.buttonStyle(.lifeSecondary)
+            #if os(iOS)
+            if item.source == .location, item.place == nil {
+                Button("给地点起名") { placeName = ""; namingPlace = item }.buttonStyle(.lifeSecondary)
+            }
+            #endif
             if needsTitle {
                 Button("填写当时在做什么") { var draft = item; if item.source == .location { draft.title = "" }; block = draft }.buttonStyle(.lifePrimary)
             } else {
@@ -143,7 +155,7 @@ import LifeStore
         return [(name: "内容", value: "这个版本读不出来")]
     }
     private func conflictCard(_ conflict: RecordConflict) -> some View {
-        let versions = conflict.versions.map { (choice: $0, fields: fields($0)) }
+        let versions = conflict.versions.map { (choice: $0, fields: conflict.kind == "timer" ? [(name: "计时结果", value: $0.label)] : fields($0)) }
         var values: [String: Set<String>] = [:]
         for version in versions { for field in version.fields { values[field.name, default: []].insert(field.value) } }
         // A field differs when versions disagree on it, or when only some versions have it at all.
@@ -168,7 +180,7 @@ import LifeStore
                 .background(lifeSurface, in: RoundedRectangle(cornerRadius: 12))
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(lifeLine, lineWidth: 1))
         }
-        return warningCard(title: conflict.kind == "transaction" ? "同一笔账有不同的修改" : "同一条时间记录有不同的修改") {
+        return warningCard(title: conflict.kind == "timer" ? "同一条计时有不同的处理" : (conflict.kind == "transaction" ? "同一笔账有不同的修改" : "同一条时间记录有不同的修改")) {
             #if os(macOS)
             HStack(alignment: .top, spacing: 12) { columns }
             #else

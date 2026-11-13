@@ -33,7 +33,7 @@ import LifeStore
                           previous: { selectedDate = period.start.addingTimeInterval(-86400) },
                           next: { selectedDate = period.end.addingTimeInterval(86400) })
                 Button("读截图") { receipt = true }.buttonStyle(.lifeSecondary)
-                Button { editing = .init(amountCents: 0, kind: .expense, category: "餐饮", merchant: "", account: "微信") } label: {
+                Button { editing = newTransactionDraft() } label: {
                     Label("记一笔", systemImage: "plus")
                 }.buttonStyle(.lifePrimary)
             }

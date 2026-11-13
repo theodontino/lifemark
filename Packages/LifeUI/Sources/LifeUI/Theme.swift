@@ -215,6 +215,21 @@ extension View {
             .background(lifeGround, in: RoundedRectangle(cornerRadius: 10))
             .overlay(RoundedRectangle(cornerRadius: 10).stroke(lifeFieldLine, lineWidth: 1))
     }
+    /// iPhone: drag to dismiss, plus a 完成 button above the keyboard (the decimal pad and multi-line
+    /// fields have no return key). No-op on the Mac.
+    @ViewBuilder func keyboardDismissible() -> some View {
+        #if os(iOS)
+        self.scrollDismissesKeyboard(.interactively)
+            .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("完成") { UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) }
+                }
+            }
+        #else
+        self
+        #endif
+    }
     // Use the native decimal keyboard on iPhone while retaining the Mac text field.
     @ViewBuilder func moneyInput() -> some View {
         #if os(iOS)
@@ -245,7 +260,7 @@ struct PageScroll<Content: View>: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) { content }
                 .padding(pagePadding).frame(maxWidth: 980, alignment: .leading).frame(maxWidth: .infinity)
-        }.background(lifeGround)
+        }.background(lifeGround).keyboardDismissible()
     }
 }
 /// Title on the left (Mac only: iPhone shows it in the navigation bar), controls wrapping on the right.

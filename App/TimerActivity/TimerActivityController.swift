@@ -24,7 +24,7 @@ final class TimerActivityController {
 
     func install() {
         guard observers.isEmpty else { return }
-        for name in [Self.changed, UIApplication.didBecomeActiveNotification] {
+        for name in [Self.changed, LifeStore.didChangeNotification, UIApplication.didBecomeActiveNotification] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in await self?.reconcile() }
             })

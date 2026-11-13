@@ -33,12 +33,18 @@
 	<string>1</string>
 	<key>LifeCloudContainerIdentifier</key>
 	<string></string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_liferecord._tcp</string>
+	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>仅在你选择扫码配对时扫描 Mac 上的配对二维码。</string>
 	<key>NSHealthShareUsageDescription</key>
 	<string>仅在你主动使用原定位器健康功能时读取。</string>
 	<key>NSHealthUpdateUsageDescription</key>
 	<string>仅在你主动使用原定位器健康功能时写入。</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>仅在主动使用原定位器网络功能时连接。</string>
+	<string>发现并连接你配对的附近设备，在设备之间加密同步账目、事项和计时。</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 	<string>你开启后台记录后，记录地点停留，辅助回顾一天。</string>
 	<key>NSLocationWhenInUseUsageDescription</key>

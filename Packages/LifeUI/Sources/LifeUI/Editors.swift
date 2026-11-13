@@ -14,13 +14,21 @@ struct EditorSheet<Fields: View, Actions: View>: View {
         self.title = title; self.error = error; self.onDelete = onDelete; self.fields = fields(); self.actions = actions()
     }
     var body: some View {
+        #if os(iOS)
+        // The keyboard's 完成 button needs a navigation container to be shown inside a sheet.
+        NavigationStack { content.toolbar(.hidden, for: .navigationBar) }
+        #else
+        content
+        #endif
+    }
+    private var content: some View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     Text(title).font(.title2.bold())
                     fields
                 }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
-            }
+            }.keyboardDismissible()
             Rectangle().fill(lifeLine).frame(height: 1)
             VStack(alignment: .leading, spacing: 10) {
                 ErrorText(text: error)
@@ -36,6 +44,11 @@ struct EditorSheet<Fields: View, Actions: View>: View {
         .frame(minWidth: 520, idealWidth: 560, minHeight: 560, idealHeight: 680)
         #endif
     }
+}
+let lastAccountKey = "life.lastAccount"
+/// A blank expense that starts from the account used last time; the first one asks for an account.
+func newTransactionDraft() -> LifeCore.Transaction {
+    .init(amountCents: 0, kind: .expense, category: "餐饮", merchant: "", account: UserDefaults.standard.string(forKey: lastAccountKey) ?? "")
 }
 private struct LabeledField<Content: View>: View {
     let label: String
@@ -136,7 +149,8 @@ private struct LabeledField<Content: View>: View {
         let account = item.account.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !account.isEmpty, account != "待确认账户" else { error = "请填写账户，例如微信、支付宝或信用卡。"; return }
         item.amountCents = cents; item.currency = "CNY"; item.status = confirmed ? .confirmed : .pending
-        do { try store.save(item, ifUnchangedFrom: original); dismiss() } catch { self.error = error.localizedDescription }
+        item.account = account
+        do { try store.save(item, ifUnchangedFrom: original); UserDefaults.standard.set(account, forKey: lastAccountKey); dismiss() } catch { self.error = error.localizedDescription }
     }
 }
 
@@ -165,7 +179,7 @@ private struct LabeledField<Content: View>: View {
                 Text("持续 " + durationText(item.end.timeIntervalSince(item.start))).fontWeight(.semibold).foregroundStyle(lifeAccentText)
             }
             LabeledField(label: "备注（可不填）") { TextField("", text: $item.note, axis: .vertical).lineLimit(1...4).lifeField().accessibilityLabel("备注") }
-            if item.source != .manual { Text("来源：\(item.source.label)").font(.callout).foregroundStyle(.secondary) }
+            if item.source != .manual { Text("来源：\(item.source.label)" + (item.place.map { " · 地点：\($0)" } ?? "")).font(.callout).foregroundStyle(.secondary) }
             if !item.evidence.isEmpty {
                 DisclosureGroup("查看自动记录的依据") { Text(item.evidence).font(.callout).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
             }

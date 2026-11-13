@@ -1,5 +1,6 @@
 import Foundation
 import LifeStore
+import LifeNearby
 
 /// One local store per process. A failed opening is shown to the user; it never creates a replacement database.
 @MainActor
@@ -17,6 +18,8 @@ enum LifeIntegrationStore {
         case .failure: return nil
         }
     }
+
+    static let nearby: NearbySyncController? = shared.map { NearbySyncController(store: $0) }
 
     static var openingError: String? {
         switch result {

@@ -37,7 +37,7 @@ import LifeStore
         PageScroll {
             PageHeader("现在", subtitle: monthDay(Date()) + " " + weekdayText(Date())) {
                 Button("读截图") { receipt = true }.buttonStyle(.lifeSecondary)
-                Button { transaction = .init(amountCents: 0, kind: .expense, category: "餐饮", merchant: "", account: "微信") } label: {
+                Button { transaction = newTransactionDraft() } label: {
                     Label("记一笔", systemImage: "plus")
                 }.buttonStyle(.lifeSecondary)
             }

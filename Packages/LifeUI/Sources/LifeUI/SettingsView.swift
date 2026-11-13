@@ -2,6 +2,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 import LifeCore
 import LifeStore
+import LifeNearby
 
 struct LifeBackup: FileDocument {
     static var readableContentTypes: [UTType] { [.json] }
@@ -13,6 +14,7 @@ struct LifeBackup: FileDocument {
 @MainActor struct SettingsView: View {
     let store: LifeStore
     let capturePanel: AnyView?
+    var nearbyController: NearbySyncController? = nil
     @AppStorage("life.billingDay") private var billingDay = 1
     @AppStorage("life.ai.enabled") private var aiEnabled = false
     @AppStorage("life.ai.baseURL") private var baseURL = ""
@@ -39,6 +41,7 @@ struct LifeBackup: FileDocument {
                 }
                 Text("导出是可阅读的记录副本，含待核对记录；不包含录屏、原始定位、冲突历史和密钥。").font(.caption).foregroundStyle(.secondary)
             }
+            if let nearbyController { NearbySyncSettingsView(controller: nearbyController) }
             Section("账期") {
                 Stepper("每月 \(billingDay) 日开始",value:$billingDay,in:1...31)
                 Text("遇到没有该日期的月份，使用当月最后一天。自然月平均另按每月1日起统计。").font(.caption).foregroundStyle(.secondary)
@@ -53,10 +56,7 @@ struct LifeBackup: FileDocument {
                 Text("地址、模型和密钥修改后自动保存。密钥保存在本机钥匙串。").font(.caption).foregroundStyle(.secondary)
                 Text("截图识别发送OCR文字；回顾发送页面列出的汇总。费用按你的服务商规则收取。此设置与屏幕引擎的模型设置暂分别配置。").font(.caption).foregroundStyle(.secondary)
             }
-            if let capturePanel { Section("自动记录设置") { capturePanel } }
-            #if os(iOS)
-            Section("iPhone 自动记录") { Text("通过上方按钮打开定位采集设置，需你主动开启。位置只能提供地点停留线索，不能直接证明在做什么。").font(.callout) }
-            #endif
+            if let capturePanel { Section("自动记录") { capturePanel } }
             Section("回顾的口径") {
                 Text("只记录实际发生的事情。自动线索待核对后计入统计。信用卡还款与转账不计消费；退款抵扣净支出。")
                 Text("平均月账目只反映有记录月份；没有记录不代表没有花钱。消费是否值得由你标记。")
@@ -69,7 +69,7 @@ struct LifeBackup: FileDocument {
             }
             if let status { Section { Text(status).foregroundStyle(lifeAccentText) } }
             if error != nil || store.errorMessage != nil { Section { ErrorText(text:error ?? store.errorMessage) } }
-        }.formStyle(.grouped).navigationTitle("设置与数据")
+        }.formStyle(.grouped).keyboardDismissible().navigationTitle("设置")
             .task { loadKey() }
             .onChange(of: key) { _, _ in
                 saveKey()

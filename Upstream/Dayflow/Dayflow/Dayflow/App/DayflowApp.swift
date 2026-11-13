@@ -290,9 +290,7 @@ struct DayflowApp: App {
   private let updaterManager = UpdaterManager.shared
 
   var body: some Scene {
-    MenuBarExtra { LifeTimerMenuContent() } label: { LifeTimerMenuLabel() }
-      .menuBarExtraStyle(.window)
-
+    // Keep the main window first so a fresh installation opens the timer home.
     Window("人生记录", id: "life") {
       LifeMacRoot()
     }
