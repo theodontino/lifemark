@@ -6,7 +6,7 @@ struct LifeMacRoot: View {
     var body: some View {
         Group {
             if let store = LifeIntegrationStore.shared {
-                LifeRootView(store: store, capturePanel: AnyView(LifeScreenCapturePanel()), nearbyController: LifeIntegrationStore.nearby)
+                LifeRootView(store: store, capturePanel: AnyView(VStack(alignment: .leading, spacing: 18) { LifeScreenCapturePanel(); Divider(); LifeVoiceExperimentPanel() }), nearbyController: LifeIntegrationStore.nearby)
                     .task { LifeIntegrationStore.nearby?.start(); LifeTimerOverlay.shared.install(); importError = await syncDayflowSummaries() }
                     .onReceive(NotificationCenter.default.publisher(for: .timelineDataUpdated)) { _ in
                         Task { importError = await syncDayflowSummaries() }

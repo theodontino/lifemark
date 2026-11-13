@@ -223,6 +223,7 @@
 		5DB24624388EFA76E16BE647 /* Dependency-grdb.swift-LICENSE in Resources */ = {isa = PBXBuildFile; fileRef = 415C55F5A9010AB740DAF57B /* Dependency-grdb.swift-LICENSE */; };
 		5E0E7DBAFCDCD601029261E3 /* DailyRecapGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 753DDB5A58EDE2BF20490E71 /* DailyRecapGenerator.swift */; };
 		5E71D81D9F82BC5A934D728B /* LifeScreenModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = 610262FE2DFE42DF916D7150 /* LifeScreenModule.swift */; };
+		C5B4A3928170F6E5D4C3B2A1 /* LifeVoiceExperiment.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5C /* LifeVoiceExperiment.swift */; };
 		5EFA0D83D7F35A550C26D176 /* DayflowOnboarding.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = F3E09F5828D3F9A43708362F /* DayflowOnboarding.mp4 */; };
 		5F0FBD65E3375CF5838A25CB /* LifeScreenCapturePanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDC8E5F08EBEDBE70A733A4A /* LifeScreenCapturePanel.swift */; };
 		5FEDF4F34DA5D4F925305517 /* flow_bath_loop.mov in Resources */ = {isa = PBXBuildFile; fileRef = 4995D423F4825DAC879F5DA8 /* flow_bath_loop.mov */; };
@@ -881,6 +882,7 @@
 		5F4DD8D6369495456B5076F0 /* ClaudeTimelinePrompt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudeTimelinePrompt.swift; sourceTree = "<group>"; };
 		6062F1B2BAC86ABEE22E4B59 /* OpenSansCondensed-Bold.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "OpenSansCondensed-Bold.ttf"; sourceTree = "<group>"; };
 		610262FE2DFE42DF916D7150 /* LifeScreenModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LifeScreenModule.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4B5C /* LifeVoiceExperiment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LifeVoiceExperiment.swift; sourceTree = "<group>"; };
 		612CE9756CFADD88AF838F46 /* AccessibilityLogCondenser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccessibilityLogCondenser.swift; sourceTree = "<group>"; };
 		6136719123B26783A0ECA600 /* CodexTimelinePrompt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexTimelinePrompt.swift; sourceTree = "<group>"; };
 		618F454660316C8E60445EE8 /* ChatMetadataParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMetadataParser.swift; sourceTree = "<group>"; };
@@ -1915,6 +1917,7 @@
 				6551810D867B295E14F6514D /* LifeMacRoot.swift */,
 				FDC8E5F08EBEDBE70A733A4A /* LifeScreenCapturePanel.swift */,
 				610262FE2DFE42DF916D7150 /* LifeScreenModule.swift */,
+				A1B2C3D4E5F60718293A4B5C /* LifeVoiceExperiment.swift */,
 				6D8198C466941641AB665CC7 /* LifeTimerOverlay.swift */,
 			);
 			name = Mac;
@@ -2852,6 +2855,7 @@
 				AAD223FED83746945D9DEB5A /* LifeMacRoot.swift in Sources */,
 				5F0FBD65E3375CF5838A25CB /* LifeScreenCapturePanel.swift in Sources */,
 				5E71D81D9F82BC5A934D728B /* LifeScreenModule.swift in Sources */,
+				C5B4A3928170F6E5D4C3B2A1 /* LifeVoiceExperiment.swift in Sources */,
 				EE6A88BF21FCDEB1943CF2B6 /* LifeTimerOverlay.swift in Sources */,
 				16C5DBA0FBD5E98573607874 /* Lifecycle.swift in Sources */,
 				F33389832AAD8A6AA5AA1B1A /* LightWindowGradient.swift in Sources */,

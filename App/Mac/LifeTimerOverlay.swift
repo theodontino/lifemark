@@ -11,6 +11,12 @@ private func timerClock(_ start: Date, now: Date = Date()) -> String {
     @Published var title = ""
     @Published var category = "工作"
 }
+/// Lets one call site pick between two built-in button styles.
+struct AnyPrimitiveButtonStyle: PrimitiveButtonStyle {
+    private let make: (Configuration) -> AnyView
+    init<S: PrimitiveButtonStyle>(_ style: S) { make = { AnyView(style.makeBody(configuration: $0)) } }
+    func makeBody(configuration: Configuration) -> some View { make(configuration) }
+}
 @MainActor struct LifeQuickTimerControls: View {
     let store: LifeStore
     @StateObject private var draft: LifeQuickTimerDraft
@@ -46,14 +52,26 @@ private func timerClock(_ start: Date, now: Date = Date()) -> String {
             TextField(store.runningTimers.isEmpty ? "现在做什么？" : "下一项做什么？", text: $draft.title)
                 .textFieldStyle(.roundedBorder).focused($editingTitle)
                 .onSubmit {
-                    if store.runningTimers.isEmpty { begin() }
+                    if store.runningTimers.isEmpty { begin(replacing: false) }
                     else { editingTitle = false }
                 }
             Picker("类别", selection: $draft.category) {
                 ForEach(categories, id: \.self) { Text($0).tag($0) }
             }
-            Button(store.runningTimers.count == 1 ? "结束当前，开始下一项" : "开始计时") { begin() }
-                .disabled(draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            // With a timer running there are always two explicit choices: replace it, or run alongside it.
+            HStack(spacing: 8) {
+                if store.runningTimers.isEmpty {
+                    Button("开始计时") { begin(replacing: false) }.buttonStyle(.borderedProminent)
+                } else {
+                    if store.runningTimers.count == 1 {
+                        Button("切换到这一项") { begin(replacing: true) }.buttonStyle(.borderedProminent)
+                            .help("结束当前计时并保存，然后开始这一项")
+                    }
+                    Button("同时开始") { begin(replacing: false) }
+                        .buttonStyle(store.runningTimers.count == 1 ? AnyPrimitiveButtonStyle(.bordered) : AnyPrimitiveButtonStyle(.borderedProminent))
+                        .help("当前计时继续，这一项同时开始计时")
+                }
+            }.disabled(draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             if let error { Text(error).font(.caption).foregroundStyle(.red) }
         }
         .confirmationDialog("放弃这次未完成的计时？", isPresented: Binding(
@@ -78,11 +96,11 @@ private func timerClock(_ start: Date, now: Date = Date()) -> String {
         do { _ = try store.finishTimer(id: id); error = nil }
         catch { self.error = error.localizedDescription }
     }
-    private func begin() {
+    private func begin(replacing: Bool) {
         let name = draft.title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
         do {
-            if store.runningTimers.count == 1, let timer = store.runningTimers.first {
+            if replacing, store.runningTimers.count == 1, let timer = store.runningTimers.first {
                 guard Date().timeIntervalSince(timer.start) <= 7 * 24 * 3600 else {
                     recovering = timer
                     error = "请先核对长计时的结束时间，再开始下一项。"
@@ -179,7 +197,7 @@ private final class TimerFloatingPanel: NSPanel {
             panel?.orderOut(nil); expanded = false; return
         }
         let inset = max(screen.safeAreaInsets.top, screen.frame.maxY - screen.visibleFrame.maxY)
-        let content: CGFloat = min(screen.frame.height - inset - 80, CGFloat(max(270, 150 + store.runningTimers.count * 115)))
+        let content: CGFloat = min(screen.frame.height - inset - 80, CGFloat(max(360, 250 + store.runningTimers.count * 150)))
         // On a display with a notch the bar becomes an island: black "ears" extend the notch to both
         // sides inside the menu bar, the way the Dynamic Island does on iPhone.
         var notch: CGFloat?

@@ -35,7 +35,9 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>发现并连接你配对的附近设备，在设备之间加密同步账目、事项和计时。</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>仅在你主动使用上游语音功能时访问麦克风。</string>
+	<string>你开启“把身边的声音转成文字”这个试验功能后，用麦克风录音并在本机转成文字。</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>在这台 Mac 上把你开启试验功能后录下的声音转成文字，不上传。</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>读取屏幕内容，帮助回顾实际做过的事情；你可以随时暂停。</string>
 	<key>SUAllowsAutomaticUpdates</key>

@@ -49,7 +49,8 @@ targets:
         NSBonjourServices: ["_liferecord._tcp"]
         NSScreenCaptureUsageDescription: 读取屏幕内容，帮助回顾实际做过的事情；你可以随时暂停。
         NSAppleEventsUsageDescription: 在你选择时读取浏览器活动背景，用于回顾。
-        NSMicrophoneUsageDescription: 仅在你主动使用上游语音功能时访问麦克风。
+        NSMicrophoneUsageDescription: 你开启“把身边的声音转成文字”这个试验功能后，用麦克风录音并在本机转成文字。
+        NSSpeechRecognitionUsageDescription: 在这台 Mac 上把你开启试验功能后录下的声音转成文字，不上传。
         LifeCloudContainerIdentifier: ""
         SUEnableAutomaticChecks: false
         SUAutomaticallyUpdate: false
