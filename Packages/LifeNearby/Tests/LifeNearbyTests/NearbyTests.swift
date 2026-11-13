@@ -264,3 +264,48 @@ struct NearbyControllerTests {
         #expect(left.errorMessage == nil && right.errorMessage == nil)
     }
 }
+
+struct NearbySettingsTests {
+    @MainActor private final class Box { var value: NearbySharedSettings; var applied = 0; init(_ value: NearbySharedSettings) { self.value = value } }
+
+    @Test @MainActor func onlyAnAuthenticatedPeerWithANewerCopyChangesTheKey() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try LifeStore(databaseURL: directory.appendingPathComponent("store.sqlite"))
+        let token = try PairingToken.create(serviceID: UUID().uuidString), remote = UUID()
+        let credential = PeerCredential(pairID: token.pairID, key: token.key, peerID: remote, peerName: "Known", remoteServiceID: token.serviceID)
+        var vault = NearbyVault(); vault.credentials = [credential]
+        let controller = NearbySyncController(store: store, identity: vault)
+        let box = Box(NearbySharedSettings(baseURL: "https://old.example/v1", model: "old", key: "old-key", updatedAt: Date(timeIntervalSince1970: 1000)))
+        controller.settingsBridge = NearbySettingsBridge(read: { box.value }, apply: { box.value = $0; box.applied += 1 }, changed: Notification.Name("NearbySettingsTests.\(UUID())"))
+        func channel(authenticated: Bool) -> NearbyChannel {
+            let channel = NearbyChannel(connection: NWConnection(host: "127.0.0.1", port: 1, using: .tcp), outgoing: true)
+            channel.hello = NearbyHello(pairID: token.pairID, key: token.key, deviceID: remote, serviceID: token.serviceID, name: "Known")
+            if authenticated { channel.credential = credential; channel.markAuthenticated() }
+            return channel
+        }
+        let newer = NearbySharedSettings(baseURL: "https://new.example/v1", model: "new", key: "new-key", updatedAt: Date(timeIntervalSince1970: 2000))
+        // A peer that has not finished pairing cannot set the key.
+        controller.receive(.settings(newer), channel: channel(authenticated: false))
+        #expect(box.applied == 0 && box.value.key == "old-key")
+        // An older or equal copy is ignored.
+        controller.receive(.settings(NearbySharedSettings(baseURL: "x", model: "x", key: "stale", updatedAt: Date(timeIntervalSince1970: 500))), channel: channel(authenticated: true))
+        controller.receive(.settings(NearbySharedSettings(baseURL: "x", model: "x", key: "same-time", updatedAt: Date(timeIntervalSince1970: 1000))), channel: channel(authenticated: true))
+        #expect(box.applied == 0)
+        // A newer copy from a paired device replaces all three values.
+        controller.receive(.settings(newer), channel: channel(authenticated: true))
+        #expect(box.applied == 1 && box.value == newer)
+        // Receiving it again changes nothing, so the exchange cannot loop.
+        controller.receive(.settings(newer), channel: channel(authenticated: true))
+        #expect(box.applied == 1)
+        // An oversized value is refused.
+        controller.receive(.settings(NearbySharedSettings(baseURL: "u", model: "m", key: String(repeating: "k", count: 9000), updatedAt: Date(timeIntervalSince1970: 3000))), channel: channel(authenticated: true))
+        #expect(box.applied == 1)
+    }
+    @Test func settingsMessageSurvivesEncoding() throws {
+        let value = NearbySharedSettings(baseURL: "https://example/v1", model: "m", key: "k", updatedAt: Date(timeIntervalSince1970: 1_800_000_000))
+        let decoded = try JSONDecoder().decode(NearbyMessage.self, from: JSONEncoder().encode(NearbyMessage.settings(value)))
+        guard case .settings(let back) = decoded else { Issue.record("wrong case"); return }
+        #expect(back == value)
+    }
+}

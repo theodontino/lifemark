@@ -50,6 +50,7 @@ import UIKit
                     Button("立即同步") { controller.syncNow() }.buttonStyle(LifeButtonStyle(compact: true))
                 }
                 pairingControls
+                Text("AI 的接口地址、模型和密钥也会在已配对的设备之间同步，以最近修改的为准。“允许调用 AI”的开关每台设备各自决定。").font(.callout).foregroundStyle(.secondary)
                 #if os(iOS)
                 Text("iPhone 切到后台时暂停同步，回到前台自动补齐。").font(.callout).foregroundStyle(.secondary)
                 #endif

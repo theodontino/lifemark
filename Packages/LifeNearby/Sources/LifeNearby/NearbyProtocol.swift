@@ -104,6 +104,29 @@ enum NearbyMessage: Codable, Sendable {
     case seal(String)
     case sealAck(String)
     case cancel
+    case settings(NearbySharedSettings)
+}
+
+/// The AI service configuration shared between a person's own paired devices.
+/// It travels only over an authenticated, finalized pairing; the newer copy wins.
+public struct NearbySharedSettings: Codable, Sendable, Equatable {
+    public var baseURL: String
+    public var model: String
+    public var key: String
+    public var updatedAt: Date
+    public init(baseURL: String, model: String, key: String, updatedAt: Date) {
+        self.baseURL = baseURL; self.model = model; self.key = key; self.updatedAt = updatedAt
+    }
+    var isPlausible: Bool { baseURL.utf8.count <= 2048 && model.utf8.count <= 512 && key.utf8.count <= 8192 }
+}
+/// How the sync layer reads and writes those settings without knowing where they are stored.
+public struct NearbySettingsBridge {
+    public var read: @MainActor () -> NearbySharedSettings?
+    public var apply: @MainActor (NearbySharedSettings) -> Void
+    public var changed: Notification.Name
+    public init(read: @escaping @MainActor () -> NearbySharedSettings?, apply: @escaping @MainActor (NearbySharedSettings) -> Void, changed: Notification.Name) {
+        self.read = read; self.apply = apply; self.changed = changed
+    }
 }
 struct FrameDecoder {
     static let maximumBytes = 8 * 1024 * 1024

@@ -47,6 +47,7 @@ enum LifeSection: Int, CaseIterable, Identifiable {
         }
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name("LifeRecord.showTimer"))) { _ in section = .now }
         .tint(lifeAccent).environment(\.locale, lifeLocale)
+        .task { if let nearbyController, nearbyController.settingsBridge == nil { nearbyController.settingsBridge = LifeAIConfiguration.nearbyBridge() } }
     }
 
     @ViewBuilder private func page(_ selection: LifeSection) -> some View {

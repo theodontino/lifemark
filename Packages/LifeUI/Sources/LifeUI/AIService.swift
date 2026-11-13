@@ -1,5 +1,7 @@
 import Foundation
 import Security
+import CryptoKit
+import LifeNearby
 
 enum LifeAIError: LocalizedError {
     case message(String)
@@ -38,6 +40,44 @@ public enum LifeAIConfiguration {
     public static let didChange = Notification.Name("LifeRecord.aiConfigurationChanged")
     public static func readAPIKey() throws -> String { try LifeKeychain.read() }
     public static func saveAPIKey(_ value: String) throws { try LifeKeychain.save(value) }
+
+    // MARK: Sharing with paired devices
+
+    private static let stampKey = "life.ai.updatedAt", fingerprintKey = "life.ai.fingerprint"
+    private static func fingerprint(_ baseURL: String, _ model: String, _ key: String) -> String {
+        SHA256.hash(data: Data((baseURL + "\u{0}" + model + "\u{0}" + key).utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+    /// Records when the address, model or key last changed on this device. Called after edits;
+    /// does nothing when the three values are the same as last time.
+    @MainActor public static func noteLocalChange(now: Date = Date()) {
+        let defaults = UserDefaults.standard
+        guard let key = try? LifeKeychain.read() else { return }
+        let baseURL = defaults.string(forKey: "life.ai.baseURL") ?? "", model = defaults.string(forKey: "life.ai.model") ?? ""
+        let current = fingerprint(baseURL, model, key)
+        guard defaults.string(forKey: fingerprintKey) != current else { return }
+        defaults.set(current, forKey: fingerprintKey)
+        // An empty configuration never overrides a filled one on another device.
+        defaults.set(baseURL.isEmpty && model.isEmpty && key.isEmpty ? 0 : now.timeIntervalSince1970, forKey: stampKey)
+    }
+    /// Lets nearby sync carry the address, model and key between a person's own devices.
+    /// "允许调用 AI" stays a per-device choice and is not shared.
+    @MainActor public static func nearbyBridge() -> NearbySettingsBridge {
+        noteLocalChange()
+        return NearbySettingsBridge(read: {
+            let defaults = UserDefaults.standard
+            guard let key = try? LifeKeychain.read() else { return nil }
+            return NearbySharedSettings(baseURL: defaults.string(forKey: "life.ai.baseURL") ?? "", model: defaults.string(forKey: "life.ai.model") ?? "",
+                                        key: key, updatedAt: Date(timeIntervalSince1970: defaults.double(forKey: stampKey)))
+        }, apply: { remote in
+            let defaults = UserDefaults.standard
+            // The key goes in first: if the keychain refuses it, nothing else changes.
+            guard (try? LifeKeychain.save(remote.key)) != nil else { return }
+            defaults.set(remote.baseURL, forKey: "life.ai.baseURL"); defaults.set(remote.model, forKey: "life.ai.model")
+            defaults.set(fingerprint(remote.baseURL, remote.model, remote.key), forKey: fingerprintKey)
+            defaults.set(remote.updatedAt.timeIntervalSince1970, forKey: stampKey)
+            NotificationCenter.default.post(name: didChange, object: nil)
+        }, changed: didChange)
+    }
 }
 private final class SameOriginRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {

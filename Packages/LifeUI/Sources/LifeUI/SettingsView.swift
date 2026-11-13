@@ -72,6 +72,10 @@ struct LifeBackup: FileDocument {
             if error != nil || store.errorMessage != nil { Section { ErrorText(text:error ?? store.errorMessage) } }
         }.formStyle(.grouped).keyboardDismissible().navigationTitle("设置")
             .task { loadKey() }
+            // A paired device may have sent a newer key while this page is open.
+            .onReceive(NotificationCenter.default.publisher(for: LifeAIConfiguration.didChange)) { _ in
+                if let stored = try? LifeAIConfiguration.readAPIKey(), stored != persistedKey { loadKey() }
+            }
             .onChange(of: aiEnabled) { _, _ in configurationChanged() }
             .onChange(of: baseURL) { _, _ in configurationChanged() }
             .onChange(of: model) { _, _ in configurationChanged() }
@@ -82,7 +86,7 @@ struct LifeBackup: FileDocument {
                 switch result { case .success: status = "记录已导出。"; case .failure(let e): error = e.localizedDescription }
             }
     }
-    private func configurationChanged() { NotificationCenter.default.post(name: LifeAIConfiguration.didChange, object: nil) }
+    private func configurationChanged() { LifeAIConfiguration.noteLocalChange(); NotificationCenter.default.post(name: LifeAIConfiguration.didChange, object: nil) }
     private func loadKey() {
         keyLoaded = false
         do { let loaded = try LifeKeychain.read(); persistedKey = loaded; key = loaded; keyLoaded = true; error = nil }

@@ -45,6 +45,18 @@ public final class NearbySyncController {
     @ObservationIgnored private var maintenance: Task<Void, Never>?
     @ObservationIgnored private var observedGeneration: UInt64 = 0
     @ObservationIgnored private let observer = NearbyObserver()
+    @ObservationIgnored private let settingsObserver = NearbyObserver()
+    /// Set by the app to share the AI service configuration with paired devices.
+    @ObservationIgnored public var settingsBridge: NearbySettingsBridge? {
+        didSet {
+            if let token = settingsObserver.token { NotificationCenter.default.removeObserver(token); settingsObserver.token = nil }
+            guard let bridge = settingsBridge else { return }
+            settingsObserver.token = NotificationCenter.default.addObserver(forName: bridge.changed, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.sendSettingsToAll() }
+            }
+            sendSettingsToAll()
+        }
+    }
     private static let serviceType = "_liferecord._tcp"
 
     public init(store: LifeStore) {
@@ -294,6 +306,7 @@ public final class NearbySyncController {
                 }
                 guard channel.authenticated, let credential = channel.credential,
                       vault?.credentials.contains(where: { $0.pairID == credential.pairID && $0.peerID == credential.peerID }) == true else { throw NearbyError.unauthorized }
+                if case .settings(let remote) = message { receiveSettings(remote); return }
                 try receiveSync(message, channel: channel)
             }
         } catch { channel.stop(error) }
@@ -349,6 +362,19 @@ public final class NearbySyncController {
             restartListener()
         }
         errorMessage = nil; state = "已连接，正在核对记录…"; refreshPeers(); sendInventory(channel)
+        sendSettings(channel)
+    }
+    private func sendSettings(_ channel: NearbyChannel) {
+        guard channel.authenticated, let settings = settingsBridge?.read(), settings.isPlausible else { return }
+        channel.send(.settings(settings))
+    }
+    private func sendSettingsToAll() { for channel in channels.values where channel.authenticated { sendSettings(channel) } }
+    /// The newer copy wins. An equal or older copy is ignored, which also ends the echo that
+    /// follows applying a received copy.
+    private func receiveSettings(_ remote: NearbySharedSettings) {
+        guard let bridge = settingsBridge, remote.isPlausible else { return }
+        guard let local = bridge.read() else { return }
+        if remote.updatedAt > local.updatedAt { bridge.apply(remote) }
     }
     private func storeChanged() {
         guard observedGeneration != store.changeGeneration else { return }; observedGeneration = store.changeGeneration
